@@ -126,6 +126,22 @@ class GuardConfig:
 
 
 @dataclass(frozen=True)
+class RLConfig:
+    """RL policy configuration (Phase 4/5). All values env-tunable."""
+
+    n_obs_steps: int = 10           # samples per observation window
+    n_train_steps: int = 100_000    # default PPO timesteps per run
+    checkpoint_dir: Path = Path("~/os-rl-agent/checkpoints")
+    eval_gate_mae_ratio: float = 0.05   # must beat NOOP by this fraction
+    advise_cooldown_steps: int = 15     # min steps between RENICE_BACK suggestions
+    # Synthetic stress injection (for pretraining before real events exist)
+    synthetic_stress: bool = True
+    stress_probability: float = 0.15
+    stress_psi_ratio: float = 0.40
+    stress_swp_out_ps: float = 1500.0
+
+
+@dataclass(frozen=True)
 class Config:
     db_path: Path
     collector: CollectorConfig = CollectorConfig()
@@ -133,6 +149,7 @@ class Config:
     risk: RiskConfig = RiskConfig()
     psi_trigger: PsiTriggerConfig = PsiTriggerConfig()
     guard: GuardConfig = GuardConfig()
+    rl: RLConfig = RLConfig()
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -175,5 +192,17 @@ def load_config() -> Config:
             renice_step=_int("OSRL_GUARD_RENICE_STEP", 10),
             min_spacing_s=_float("OSRL_GUARD_MIN_SPACING_S", 300.0),
             restore_capable=_bool("OSRL_GUARD_RESTORE_CAPABLE", False),
+        ),
+        rl=RLConfig(
+            n_obs_steps=_int("OSRL_RL_OBS_STEPS", 10),
+            n_train_steps=_int("OSRL_RL_TRAIN_STEPS", 100_000),
+            checkpoint_dir=_path("OSRL_RL_CHECKPOINT_DIR",
+                                  "~/os-rl-agent/checkpoints"),
+            eval_gate_mae_ratio=_float("OSRL_RL_EVAL_GATE", 0.05),
+            advise_cooldown_steps=_int("OSRL_RL_COOLDOWN_STEPS", 15),
+            synthetic_stress=_bool("OSRL_RL_SYNTHETIC", True),
+            stress_probability=_float("OSRL_RL_STRESS_PROB", 0.15),
+            stress_psi_ratio=_float("OSRL_RL_STRESS_PSI", 0.40),
+            stress_swp_out_ps=_float("OSRL_RL_STRESS_SWP", 1500.0),
         ),
     )

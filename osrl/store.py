@@ -132,8 +132,21 @@ _V2_ACTION_COLUMNS = (
 _V2_SAMPLE_COLUMNS = ("gpu_top_procs_json TEXT",)
 
 
+# Schema v3 additions: RL metrics table + agent mode meta key
+_V3_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS rl_metrics (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    checkpoint_id TEXT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rl_metrics_ts ON rl_metrics(ts);
+"""
+
+
 class Store:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -150,6 +163,7 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
         self._migrate(self._conn)
+        self._conn.executescript(_V3_ADDITIONS)
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         """Idempotent version bump to SCHEMA_VERSION.
@@ -157,6 +171,7 @@ class Store:
         v1 -> v2: adds actions_ledger columns (before they were dead schema)
         and samples.gpu_top_procs_json; existing dbs are ALTERed in place,
         fresh dbs already carry the v2 layout and need only the marker.
+        v2 -> v3: adds rl_metrics table + agent_mode default meta row.
         An unknown FUTURE db version is a hard error (defensive).
         The intent-column index lives here (not in _SCHEMA) because legacy
         tables cannot take an index on a column they don't have yet.
@@ -191,6 +206,11 @@ class Store:
             if name not in sample_cols:
                 conn.execute(f"ALTER TABLE samples ADD COLUMN {coldef}")
         self._recreate_ledger_indexes(conn)
+        # v3: rl_metrics is created by _V3_ADDITIONS (executescript after migrate)
+        # Insert default agent_mode if absent
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('agent_mode', 'observe')"
+        )
         conn.execute(f"PRAGMA user_version={self.SCHEMA_VERSION}")
 
     def _recreate_ledger_indexes(self, conn: sqlite3.Connection) -> None:
@@ -628,6 +648,46 @@ class Store:
                     )
                     actions.append((row["id"], "back_to_pending"))
         return actions
+
+
+    # ---------------------------------------------------------------- RL helpers
+
+    def get_agent_mode(self) -> str:
+        """Read current agent mode from meta ('observe' | 'advise' | 'autopilot')."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='agent_mode'"
+        ).fetchone()
+        return str(row[0]) if row else "observe"
+
+    def set_agent_mode(self, mode: str) -> None:
+        """Set agent mode (written by Streamlit dashboard)."""
+        if mode not in ("observe", "advise", "autopilot"):
+            raise ValueError(f"invalid agent_mode: {mode!r}")
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('agent_mode', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (mode,),
+        )
+
+    def insert_rl_metric(self, kind: str, payload: dict, checkpoint_id: str | None = None) -> None:
+        """Record a training metric (train step, eval result, mode change)."""
+        try:
+            self._conn.execute(
+                "INSERT INTO rl_metrics (ts, checkpoint_id, kind, payload)"
+                " VALUES (?, ?, ?, ?)",
+                (time.time(), checkpoint_id, kind,
+                 json.dumps(payload, sort_keys=True)),
+            )
+        except Exception:  # noqa: BLE001 - metrics must never kill sampling
+            pass
+
+    def recent_rl_metrics(self, limit: int = 100) -> list[sqlite3.Row]:
+        """Most recent RL training metrics for the dashboard."""
+        return self._conn.execute(
+            "SELECT ts, checkpoint_id, kind, payload FROM rl_metrics"
+            " ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
 
 
 def _sample_to_row(s: Sample) -> dict:

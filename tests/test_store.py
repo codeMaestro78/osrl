@@ -17,7 +17,7 @@ def store(tmp_path):
 def test_wal_mode_and_schema_version(store):
     mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert str(mode).lower() == "wal"
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == Store.SCHEMA_VERSION
 
 
 def test_reopening_existing_db_works(tmp_path):
@@ -27,7 +27,7 @@ def test_reopening_existing_db_works(tmp_path):
     st.close()
     st2 = Store(db)  # reopen: schema IF NOT EXISTS path, version stays 2
     assert st2.count_samples() == 1
-    assert st2._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert st2._conn.execute("PRAGMA user_version").fetchone()[0] == Store.SCHEMA_VERSION
     st2.close()
 
 
