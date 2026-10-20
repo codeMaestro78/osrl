@@ -7,7 +7,8 @@ REPO = Path(__file__).resolve().parents[1]
 
 # The safety path must be free of RL/model imports, forever, by construction.
 FORBIDDEN_MODULE_ROOTS = (
-    "torch", "stable_baselines", "sb3_contrib", "gymnasium", "gym",
+    "torch", "stable_baselines", "stable_baselines3", "sb3_contrib",
+    "gymnasium", "gym",
     "sklearn", "keras", "tensorflow", "transformers",
 )
 GUARD_CHAIN_MODULES = (
