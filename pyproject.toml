@@ -14,13 +14,31 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+dashboard = [
+    "streamlit>=1.50,<2",
+    "plotly>=5.20",
+    "pandas>=2.0",
+    "numpy>=1.26",
+]
+rl  = [
+    "torch>=2.0",
+    "gymnasium>=0.29",
+    "stable-baselines3>=2.3",
+    "sb3-contrib>=2.3",
+    "streamlit>=1.35",
+    "plotly>=5.20",
+]
+
 
 [project.scripts]
-osrl-collector = "osrl.daemon:main"
-osrl-twin = "osrl.twin:main"
+osrl-collector  = "osrl.daemon:main"
+osrl-twin       = "osrl.twin:main"
+osrl-train      = "osrl.rl.train:main"
+osrl-auto-train = "osrl.rl.auto_train:main"
+osrl-dashboard  = "osrl.dashboard._entrypoint:main"
 
 [tool.setuptools]
-packages = ["osrl"]
+packages = ["osrl", "osrl.rl", "osrl.dashboard", "osrl.dashboard.pages"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
