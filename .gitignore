@@ -9,10 +9,14 @@ dist/
 
 # Environment + data (volumes hold telemetry, never in git)
 .venv/
-data/
+data/*
 *.db
 *.db-shm
 *.db-wal
+
+# Exception: compact recorded snapshot used by the Streamlit Cloud demo.
+# Regenerate with: python deploy/build_demo_db.py
+!data/demo_telemetry.db
 
 # Editors
 .idea/
