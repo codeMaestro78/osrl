@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Environment + data (volumes hold telemetry, never in git)
+.venv/
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors
+.idea/
+.vscode/
