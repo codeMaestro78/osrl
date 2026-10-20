@@ -55,7 +55,12 @@ def bootstrap_database(root: Path | None = None) -> str:
         # The Cloud filesystem is ephemeral; the snapshot is copied so mode
         # changes and rollup writes never touch the repository.
         demo_dst = work / "demo.db"
-        if not demo_dst.exists() or demo_dst.stat().st_size != demo_src.stat().st_size:
+        stale = (
+            not demo_dst.exists()
+            or demo_dst.stat().st_size != demo_src.stat().st_size
+            or int(demo_dst.stat().st_mtime) != int(demo_src.stat().st_mtime)
+        )
+        if stale:
             # Atomic replace so concurrent first sessions never read a partial file.
             tmp = work / f".demo.{os.getpid()}.tmp"
             shutil.copy2(demo_src, tmp)
