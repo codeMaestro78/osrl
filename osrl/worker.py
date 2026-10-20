@@ -93,6 +93,11 @@ def process_one_intent(
 
     verdict = guard.check(request, now, intent=intent_row, worker_id=worker_id)
     row_id = str(uuid.uuid4())
+    # Pre-apply nice read: recorded as the ledger's `before_nice` audit
+    # column (evidence pipeline pairs need the delta). A second read
+    # happens at apply time; if it fails, the typed executor error path
+    # below still records the failure honestly.
+    pre_nice = guard.d.read_nice(request.pid) if request.kind in _ADMITTED_KINDS else None
 
     def base_row(status: str, error: str | None) -> dict:
         return {
@@ -105,6 +110,7 @@ def process_one_intent(
             "target_nice": verdict.target_nice
             if request.kind == "renice_back"
             else request.target_nice,
+            "before_nice": pre_nice,
             "guard_checks": json.dumps(verdict.as_dict(), sort_keys=True),
             "intent_id": intent_row["id"],
             "status": status,

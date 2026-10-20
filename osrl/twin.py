@@ -28,6 +28,7 @@ Data-integrity rules carried from §11:
 from __future__ import annotations
 
 import bisect
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
@@ -269,6 +270,100 @@ class LinearTrendBaseline(Baseline):
                                    self.min_window_s)
 
 
+class EwmaBaseline(Baseline):
+    """Exponentially weighted mean: predicted value = current EWMA.
+
+    Half-life in seconds controls the memory; the observation clock uses
+    actual ts deltas so irregular sampling is honored. Abstains per
+    feature until `min_points` valid observations exist. On a mean-
+    reverting signal this is 'smoothed persistence' — the natural
+    candidate for beating raw hold on noisy-but-stable features.
+    """
+
+    name = "ewma"
+
+    def __init__(self, half_life_s: float = 60.0, min_points: int = 4) -> None:
+        self.half_life_s = half_life_s
+        self.min_points = min_points
+        self._ewma: dict[str, float] = {}
+        self._last_ts: dict[str, float] = {}
+        self._n: dict[str, int] = {}
+
+    def observe(self, features: dict, ts: float) -> None:
+        decay_cache: dict[float, float] = {}
+        for k, v in features.items():
+            if v is None:
+                continue
+            n = self._n.get(k, 0)
+            if n == 0:
+                self._ewma[k] = float(v)
+            else:
+                dt = max(ts - self._last_ts.get(k, ts), 0.0)
+                if dt not in decay_cache:
+                    decay_cache[dt] = 0.5 ** (dt / self.half_life_s)
+                w = decay_cache[dt]
+                self._ewma[k] = w * self._ewma[k] + (1.0 - w) * float(v)
+            self._last_ts[k] = ts
+            self._n[k] = n + 1
+
+    def predict_features(
+        self, feature_keys: list[str], ts: float, horizon_s: float
+    ) -> dict[str, Forecast]:  # noqa: ARG002
+        out = {}
+        for k in feature_keys:
+            if self._n.get(k, 0) < self.min_points:
+                out[k] = Forecast(None, True,
+                                  f"insufficient-history({self._n.get(k, 0)})")
+            else:
+                out[k] = Forecast(self._ewma[k], False)
+        return out
+
+    def clone(self) -> EwmaBaseline:
+        return EwmaBaseline(self.half_life_s, self.min_points)
+
+
+class RollingMedianBaseline(Baseline):
+    """Median of the trailing K observations per feature (a robust hold:
+    robust to spikes where persistence chases them, slower where the
+    signal genuinely steps)."""
+
+    name = "median"
+
+    def __init__(self, k: int = 15) -> None:
+        self.k = k
+        self._vals: dict[str, list[float]] = {}
+
+    def observe(self, features: dict, ts: float) -> None:  # noqa: ARG002
+        for key, v in features.items():
+            if v is None:
+                continue
+            vals = self._vals.setdefault(key, [])
+            vals.append(float(v))
+            if len(vals) > self.k:
+                vals.pop(0)
+
+    def predict_features(
+        self, feature_keys: list[str], ts: float, horizon_s: float
+    ) -> dict[str, Forecast]:  # noqa: ARG002
+        out = {}
+        for k in feature_keys:
+            vals = self._vals.get(k) or []
+            n = len(vals)
+            need = min(self.k, 5)
+            if n < need:
+                out[k] = Forecast(None, True, f"insufficient-history({n})")
+            else:
+                s = sorted(vals)
+                mid = n // 2
+                out[k] = Forecast(
+                    s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0, False
+                )
+        return out
+
+    def clone(self) -> RollingMedianBaseline:
+        return RollingMedianBaseline(self.k)
+
+
 def _lin_slope(series: list[tuple[float, float]]) -> float | None:
     n = len(series)
     if n < 2:
@@ -388,65 +483,244 @@ def evaluate_baselines(
 
 # ------------------------------------------------- renice forward model
 
+PAIR_WINDOW_S = 60.0       # matched pre/post window around each action
+PAIR_MIN_TICKS = 2         # per-side tick floor for a usable CPU pair
+
 SPEC_RENICE_TWIN = {
     "mechanism": (
         "renice_back lowers the target's CPU priority (nice +step). RAM is "
         "NOT directly freed; the memory effect runs through reduced CPU "
         "contention (allocation threads progress, reclaim pressure falls). "
-        "Estimand: delta psi_mem_stall_ratio and delta swp_out_ps between "
-        "matched before/after windows, per unit of nice delta, on "
-        "program-holding same-uid targets."
+        "Primary estimand: the target's own CPU share change (top-15 "
+        "cpu_pct, 0=one full core-free, 100=all cores) between matched "
+        "pre/post windows at unit nice delta; system context (psi_mem "
+        "stall ratio, swp_out_ps) recorded per pair but only estimable "
+        "once actions happen under real pressure."
     ),
     "estimation_plan": (
-        "For each applied renice_back ledger row: matching pre-window "
-        "[ts_applied-H, ts_applied) and post window [ts_applied, "
-        "ts_applied+H) from the SAME session; H in {30,60,120}s; effect = "
-        "median over pairs of (post - pre) difference-in-differences vs a "
-        "no-action matched segment; uncertainty from bootstrap; abstains "
-        "below min pairs."
+        "For each APPLIED renice_back ledger row: matching pre-window "
+        "[ts-60, ts) and post window [ts, ts+60) inside ONE session "
+        "(never across an outage gap); target CPU share via top_procs "
+        "(pid, start_time) identity; median per side with a per-side tick "
+        "floor. Prediction = before-share + median(post-pre shift) over "
+        "usable pairs. Uncertainty gate: abstain below min usable pairs; "
+        "the shift itself stays flagged UNVALIDATED until pairs exist "
+        "under contention."
     ),
+    "pair_window_s": PAIR_WINDOW_S,
     "min_pairs": 8,
     "status_on_this_deployment": (
-        "0 real action pairs recorded so far -> the model ABSTAINS on every "
-        "prediction. This is the honest state, NOT a failure: it encodes "
-        "'no evidence yet' per the same abstention rule the risk layer "
-        "uses for stale telemetry."
+        "real action pairs accumulate ONLY from explicit operator --execute "
+        "runs; with 0 usable pairs the model abstains on every prediction "
+        "— the honest state, NOT a failure: 'no evidence yet' per the same "
+        "abstention rule the risk layer applies to stale telemetry. First "
+        "live pair observed 2026-10-20 (pipeline validation; see DESIGN §15)."
     ),
 }
 
 
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    s = sorted(xs)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _session_bounds(sessions: list[Session], ts: float) -> Session | None:
+    for sess in sessions:
+        if sess.start_ts <= ts <= sess.end_ts:
+            return sess
+    return None
+
+
+def extract_renice_pairs(
+    conn: sqlite3.Connection,
+    *,
+    window_s: float = PAIR_WINDOW_S,
+    min_ticks: int = PAIR_MIN_TICKS,
+) -> list[dict]:
+    """Match each APPLIED renice_back ledger row with before/after
+    telemetry. Every returned dict is coverage-honest: unusable sides are
+    reported (cpu_pair_ok / reason) rather than dropped or fabricated."""
+    sessions = sessions_from_store(conn)
+    rows = conn.execute(
+        "SELECT id, ts_applied, target_pid, target_start_time,"
+        " before_nice, applied_nice FROM actions_ledger"
+        " WHERE kind='renice_back' AND status='applied'"
+        " AND ts_applied IS NOT NULL"
+        " ORDER BY ts_applied"
+    ).fetchall()
+
+    pairs: list[dict] = []
+    for r in rows:
+        ts = float(r["ts_applied"])
+        pid = int(r["target_pid"])
+        start_time = float(r["target_start_time"])
+        sess = _session_bounds(sessions, ts)
+        pair = {
+            "action_id": r["id"],
+            "ts_applied": ts,
+            "pid": pid,
+            "target_start_time": start_time,
+            "nice_delta": (
+                int(r["applied_nice"]) - int(r["before_nice"])
+                if r["applied_nice"] is not None
+                and r["before_nice"] is not None else None
+            ),
+            "cpu_pair_ok": False,
+            "psi_pair_ok": False,
+            "reason": "",
+        }
+        unusable = ""
+        if sess is None:
+            unusable = "no-session-at-ts"
+        elif ts - window_s < sess.start_ts or ts + window_s > sess.end_ts:
+            unusable = "window-spans-session-break"
+        if unusable:
+            pair["reason"] = unusable
+            pairs.append(pair)
+            continue
+
+        pre_ticks: list[float] = []
+        post_ticks: list[float] = []
+        psi_pre: list[float] = []
+        psi_post: list[float] = []
+        swp_pre: list[float] = []
+        swp_post: list[float] = []
+        for row in sess.rows:
+            t = float(row["ts"])
+            in_pre = ts - window_s <= t < ts
+            in_post = ts <= t < ts + window_s
+            target = None
+            try:
+                procs = json.loads(row["top_procs_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                procs = []
+            for proc in procs:
+                if (
+                    isinstance(proc, dict)
+                    and int(proc.get("pid", -1)) == pid
+                    and abs(float(proc.get("start_time", -1)
+                                  or -1) - start_time) <= 1e-3
+                    and proc.get("cpu_pct") is not None
+                ):
+                    target = float(proc["cpu_pct"])
+                    if in_pre:
+                        pre_ticks.append(target)
+                    elif in_post:
+                        post_ticks.append(target)
+            ratio = None
+            interval = row["interval_s"]
+            stall = row["psi_mem_some_stall_us"]
+            if interval and interval > 0 and stall is not None:
+                ratio = float(stall) / (float(interval) * 1e6)
+            swp = row["swp_out_ps"]
+            if ratio is not None:
+                if in_pre:
+                    psi_pre.append(ratio)
+                elif in_post:
+                    psi_post.append(ratio)
+            if swp is not None:
+                if in_pre:
+                    swp_pre.append(float(swp))
+                elif in_post:
+                    swp_post.append(float(swp))
+
+        pair["target_cpu_pct_before"] = _median(pre_ticks)
+        pair["target_cpu_pct_after"] = _median(post_ticks)
+        pair["cpu_tick_counts"] = (len(pre_ticks), len(post_ticks))
+        if len(pre_ticks) >= min_ticks and len(post_ticks) >= min_ticks:
+            pair["cpu_pair_ok"] = True
+        else:
+            pair["reason"] = (
+                f"target-in-top15-ticks pre={len(pre_ticks)} "
+                f"post={len(post_ticks)} (< {min_ticks})"
+            )
+        if psi_pre and psi_post:
+            pair["psi_mem_ratio_before"] = _median(psi_pre)
+            pair["psi_mem_ratio_after"] = _median(psi_post)
+            pair["psi_pair_ok"] = True
+        pair["swp_out_ps_before"] = _median(swp_pre)
+        pair["swp_out_ps_after"] = _median(swp_post)
+        pairs.append(pair)
+    return pairs
+
+
 class ReniceForwardModel:
-    """Action-conditioned twin: predicts renice_back effects from ledger
-    evidence. ABSTAINS everywhere until real evidence accumulates."""
+    """Action-conditioned twin: predicts the renice_back effect on the
+    target's CPU share from REAL ledger evidence. ABSTAINS until usable
+    pairs reach min_pairs; abstains on horizon mismatch; the median-shift
+    estimate is emitted only with a permanent UNVALIDATED caveat until
+    pairs exist under real contention."""
 
     name = "renice_forward"
 
     def __init__(self, conn: sqlite3.Connection, min_pairs: int = 8) -> None:
         self._conn = conn
         self.min_pairs = min_pairs
+        self._pairs_cache: list[dict] | None = None
+
+    def _refresh(self) -> None:
+        self._pairs_cache = extract_renice_pairs(self._conn)
+
+    def pairs(self) -> list[dict]:
+        if self._pairs_cache is None:
+            self._refresh()
+        return self._pairs_cache or []
+
+    def usable_pairs(self) -> list[dict]:
+        return [p for p in self.pairs() if p["cpu_pair_ok"]]
 
     def evidence_count(self) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM actions_ledger"
-            " WHERE kind='renice_back' AND status='applied'"
-        ).fetchone()
-        return int(row["n"])
+        return len(self.usable_pairs())
+
+    def fit_summary(self) -> dict:
+        """Deterministic summary over usable pairs (None fields when no
+        usable data): median CPU-share shift, IQR, per-delta coverage."""
+        usable = self.usable_pairs()
+        deltas = [
+            float(p["target_cpu_pct_after"]) - float(p["target_cpu_pct_before"])
+            for p in usable
+        ]
+        if not deltas:
+            return {"n_usable": 0, "median_shift_cpu_pct": None,
+                    "iqr_cpu_pct": None}
+        s = sorted(deltas)
+        q1 = _median(s[: len(s) // 2]) if len(s) >= 4 else None
+        q3 = _median(s[(len(s) + 1) // 2:]) if len(s) >= 4 else None
+        return {
+            "n_usable": len(s),
+            "median_shift_cpu_pct": _median(s),
+            "iqr_cpu_pct": None if q1 is None or q3 is None else q3 - q1,
+        }
 
     def predict(
-        self, applied_nice: int, before_nice: int, horizon_s: float
+        self, before_cpu_pct: float, nice_delta: int, horizon_s: float
     ) -> Forecast:
-        n = self.evidence_count()
+        usable = self.usable_pairs()
+        n = len(usable)
         if n < self.min_pairs:
             return Forecast(
                 None, True,
-                f"insufficient-real-evidence({n}<{self.min_pairs} ledger"
+                f"insufficient-real-evidence({n}<{self.min_pairs} usable"
                 f" pairs; {SPEC_RENICE_TWIN['status_on_this_deployment']})",
             )
-        # Real-pairs path (future Phase 4): difference-in-differences per
-        # SPEC_RENICE_TWIN. Unreachable until actions accumulate; refusal
-        # to fabricate is the spec-correct behavior until then.
-        raise NotImplementedError(
-            "estimation activates only with real ledger evidence"
+        if abs(horizon_s - PAIR_WINDOW_S) > 1e-9:
+            return Forecast(
+                None, True,
+                f"outcome-window-mismatch(model measured at "
+                f"{PAIR_WINDOW_S:.0f}s; asked {horizon_s:.0f}s)",
+            )
+        if nice_delta is None or nice_delta <= 0:
+            return Forecast(None, True, "renice_back requires a positive delta")
+        shift = self.fit_summary()["median_shift_cpu_pct"]
+        if shift is None:  # unreachable with n >= min_pairs; defensive
+            return Forecast(None, True, "no-usable-data")
+        return Forecast(
+            float(before_cpu_pct) + shift, False,
+            f"median-shift n={n} nice_delta={nice_delta}; UNVALIDATED",
         )
 
 

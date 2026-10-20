@@ -5,7 +5,7 @@ guarded (reversible) interventions, RL as a candidate policy that must earn
 its autonomy. See `DESIGN.md` for the architecture and `DESIGN.md` §11 for
 the research-audit amendments.
 
-## Status (Phase 3 complete — digital twin + baselines, observe-only)
+## Status (Phase 4.0 complete — policy evaluation + evidence pipeline)
 
 Implemented and tested:
 
@@ -153,6 +153,46 @@ at 120 s; psi stall-ratio MAE ~2e-4 (hold). On a mean-reverting,
 mostly-idle desktop, persistence is the number to beat, so the Phase 4
 acceptance bar is *beat-hold on this harness*, not beat-noop.
 
+### Phase 4.0 — policy evaluation + evidence pipeline (implemented)
+
+- **Candidate forecasters** (`ewma`, `rolling-median`) added to the
+  registry; beat-hold verdict is now MEASURED, not asserted (DESIGN
+  §15.1): rolling-median wins the bursty stress features (psi stall
+  ratio, swap-out rate, allocstall) by ~2-3x; hold wins the level
+  features (mem available, swap occupancy, cpu total). The Phase 4 bar
+  is now the per-feature blend — and one binding caveat: the median is
+  burst-blind, so alarm inputs must stay hold/max-shaped.
+- **Policy-level evaluation** (`osrl/policy_eval.py`): alarm policies
+  scored against a frozen mechanical event labeler (≥3 consecutive
+  critical samples; outages never bridged). Shipped comparison:
+  deployed risk tracker (replayed unchanged, real `Sample`
+  reconstruction) vs a naive single-sample threshold strawman.
+  Hysteresis demonstrably buys 1 fewer false-alarm run on a labeled
+  scenario at a documented latency cost (18 s at defaults). Zero-event
+  banks report recall=None (unmeasurable), never 0/0 coerced.
+- **Forward-model evidence pipeline**: applied ledger rows are matched
+  with ±60 s telemetry (target CPU share via top-15 (pid, start_time)
+  identity, per-side tick floor, unusable windows REPORTED not
+  interpolated); `ReniceForwardModel` now counts usable pairs, fits a
+  median shift, activates at ≥8 pairs, refuses horizon mismatch /
+  non-positive deltas, stamps every forecast UNVALIDATED.
+- **Live validation** on a dedicated 2 s experiment bank (shipped
+  default thresholds only — no env overrides): 2 operator-owned busy
+  children pinned to one core; both intents dry-peeked first, then run
+  through the standard worker `--execute` gate. Result (median shares
+  of machine total): reniced child 4.17%→0.79% while its contender
+  rose 4.17%→7.52% (one-core conservation), then both reniced →
+  4.17/4.17 again. The renice mechanism is live-verified in both
+  directions.
+- **Defect found by the pipeline** (not by review): the worker never
+  recorded `before_nice`, so ledger `nice_delta` was always NULL.
+  Fixed and test-locked; the two actions taken before the fix stay
+  delta-NULL in history (not retro-fitted).
+- Model state: 1 usable pair < 8 → still abstains everywhere (fit
+  summary publishes n=1 shift −3.35 points with the caveat). PPO
+  remains correctly deferred: no policy has beaten the blend, and the
+  recorded bank contains zero events to learn from.
+
 ## Quickstart (this repo)
 
 ```bash
@@ -160,7 +200,7 @@ python3 -m venv .venv
 ./.venv/bin/pip install -q psutil nvidia-ml-py pytest ruff  # dev install
 ./.venv/bin/pip install -e .                                 # optional: CLI entry
 
-./.venv/bin/python -m pytest -q          # full test suite (155 tests)
+./.venv/bin/python -m pytest -q          # full test suite (169 tests)
 ./.venv/bin/python -m osrl.daemon --db data/telemetry.db --once   # smoke
 ./.venv/bin/python -m osrl.daemon --db data/telemetry.db         # run forever
 

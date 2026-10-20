@@ -83,6 +83,9 @@ def test_execute_applies_renice_back_and_records_everything(env):
     row = actions[0]
     assert row["status"] == "applied"
     assert row["applied_nice"] == before + 10
+    # before_nice is the audit column the evidence pipeline needs to
+    # compute nice deltas (bug found live 2026-10-20: it was always NULL)
+    assert row["before_nice"] == before
     assert result["action_id"] == row["id"]
     guard_checks = json.loads(row["guard_checks"])
     assert all(entry["passed"] for entry in guard_checks)

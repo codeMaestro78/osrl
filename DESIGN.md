@@ -500,3 +500,114 @@ bias / coverage honesty, causality via spike-persistence mae
 arithmetic, session isolation), renice model (abstention on real
 schema, spec honesty), and the real-bank smoke (hold forms pairs at all
 horizons; noop floor exact). Full suite 155; ruff clean.
+
+## 15. Phase 4.0 implementation record (policy eval + evidence pipeline,
+2026-10-20)
+
+### 15.1 The beat-the-baseline verdict is now measured, mechanical
+
+Candidate baseline forecasters added to the registry (`ewma`,
+`rolling-median`), scored on the grown hold-test bank (2.49 h / 300
+samples, still ONE session — within-sample caveat stands):
+
+| feature           | h=30 (hold/ewma/med) | h=60 | h=120 | winner |
+|-------------------|----------------------|------|-------|--------|
+| psi_mem_ratio     | 1.49e-4/1.48e-4/0.95e-4 | 1.79e-4/1.58e-4/0.92e-4 | 1.75e-4/1.60e-4/0.95e-4 | median 3/3 |
+| swp_out_ps        | 45.4/41.3/19.5          | 52.0/46.1/19.6          | 52.4/46.5/18.9          | median 3/3 |
+| allocstall_ps     | 0.144/0.099/0.042       | 0.120/0.102/0.042       | 0.120/0.102/0.042       | median 3/3 |
+| mem_available_mib | 126/161/276             | 158/192/304             | 228/252/356             | hold 3/3 |
+| swap_used_pct     | 0.16/0.39/0.74          | 0.30/0.49/0.83          | 0.50/0.67/0.99          | hold 3/3 |
+| cpu_total_pct     | 1.49/1.66/2.40          | 1.91/1.96/2.60          | 2.32/2.30/2.86          | hold 2/3, ewma 1/3 |
+
+Reading (honest): bursty stress features (stall ratio, swap traffic,
+direct reclaim) are best predicted by the rolling MEDIAN (they are
+spikes around zero — persistence chases spikes and pays); slowly
+drifting level features (mem available, swap occupancy, CPU total) are
+best predicted by persisting (hold). So the next bar for a Phase-4
+policy is the per-feature BLEND, not any single baseline. ONE
+downstream caveat is binding: the median is burst-blind, so an alarm
+policy must NOT read its alarm inputs from the median-forecaster —
+alarm inputs stay hold/max-shaped. MAE-optimality x safety-optimality
+are different objectives; recorded deliberately.
+
+### 15.2 Policy-level evaluation (state-forecaster gap closed)
+
+`osrl/policy_eval.py` scores ALARM policies against a FROZEN mechanical
+labeler (event = >= 3 consecutive samples at risk-config critical
+thresholds, outage gaps never bridged), keeping the same integrity
+pattern as the forecast harness: causality, coverage honesty,
+zero-positives rules (recall None when no events exist — never 0/0
+coerced, never a fabricated perfect score), false alarms as maximal
+consecutive runs outside events normalized per hour.
+
+Shipped policies: `risk_tracker` (the deployed estimator replayed,
+unchanged, via real reconstructed `Sample` objects) vs
+`naive_threshold` (single-sample critical firing, no hysteresis). On a
+synthetic labeled scenario the hysteresis discipline is demonstrably
+worth real value: identical recall 1.0, but the tracker has 0 false
+alarm runs vs the naive strawman's 1, at a fully documented latency
+cost (detection delay = enter_n x cadence, e.g. 18 s at defaults).
+On the REAL bank: 0 events in 2.49 h -> recall unmeasurable, 0 false
+alarms from both policies — the only measurable column on a quiet
+desktop, honestly 0.
+
+### 15.3 Forward-model evidence pipeline + first live validation
+
+`extract_renice_pairs(conn)`: every APPLIED renice_back ledger row is
+matched with +-60 s telemetry (per-side tick floor 2, target CPU share
+via top-15 `(pid, start_time)` identity, psi/swap medians attached) and
+unusable windows are REPORTED (e.g. `window-spans-session-break`) not
+dropped or interpolated. `ReniceForwardModel` now counts USABLE pairs
+(not raw ledger rows), computes a median-shift fit summary, activates
+prediction at >= 8 usable pairs, refuses horizon mismatches and
+non-positive deltas, and stamps every non-abstaining forecast
+`UNVALIDATED`.
+
+Live validation on a DEDICATED 2-second-cadence bank (shipped-default
+guard thresholds passed unmodified — no env overrides, so
+staleness/rate/capability checks are the production values):
+
+- 2 real operator-owned targets (busy children pinned to one core,
+  contending), both intents dry-peeked FIRST (allow), then run with the
+  standard worker `--execute` gate: renice 0 -> 10 applied, read-back
+  verified on both.
+- Direct share series (medians): A 4.17 -> 0.79, contender B 4.17 ->
+  7.52 (~10%/90% of the pinned core; conservation held within one
+  core), and after B's later action both returned to 4.17/4.17 —
+  the renice mechanism works in both directions, live.
+- Pipeline pair #1 was rejected with `window-spans-session-break`
+  because the experiment daemon had been running for less than the
+  full 60 s pre-window: the honesty gate fired correctly in the field.
+- DEFECT found and fixed: the worker never recorded `before_nice`,
+  so `nice_delta` was NULL in the ledger — discovered by this pipeline,
+  not by review. Worker now records the pre-apply read as
+  `before_nice` (test-locked in both the worker suite and the pipeline
+  suite). The two actions of this session were taken BEFORE the fix, so
+  their delta reads NULL; future rows carry it.
+- Model state after the session: 1 usable pair < 8 -> still abstains
+  everywhere; `fit_summary` publishes the n=1 shift (-3.35 points of
+  machine-total CPU share) with the caveat, and the SPEC keeps the
+  abstention posture. Nothing is claimed as validated.
+
+### 15.4 Branch decision (per the Phase 4 plan)
+
+Branch (a) — "candidate policy demonstrably beats hold" — is PARTLY
+met by a mechanical blend (median-for-stress features, hold-for-level
+features), which raises the bar for RL further: a Phase-4 policy must
+beat the blend on the same harness, and the blend is beatable mainly
+where recorded pressure actually evolves (needs real sessions with
+events — the current bank has zero events). Branch (b) — accumulate
+real action evidence — is now PROCESS-VALIDATED end-to-end (2 actions,
+1 usable pair, defect fixed); reaching the 8-pair activation bar needs
+more spread-out operator-approved `--execute` runs (per-target spacing
+300 s). PPO still has no reason to exist here yet: no policy to
+control has beaten the blend, and the event bank is empty.
+
+### 15.5 Tests: 169 passing (155 before)
+
+New: tests/test_policy_eval.py (7) incl. hysteresis-vs-naive value,
+zero-positives honesty, prealarm-only runs; twin suite +9 more
+(ewma/median semantics, spike robustness vs hold, evidence extraction
+with session-break rejection, model activation arithmetic at 8 pairs,
+horizon-mismatch + delta-direction refusal, SPEC honesty). Worker
+suite: before_nice audit assertion. Full suite 169; ruff clean.
