@@ -1,0 +1,10 @@
+# Streamlit Community Cloud dependencies for the dashboard only.
+#
+# Deliberately NOT the full `.[rl]` extra: torch + stable-baselines3 would add
+# ~1 GB to the Cloud build. Training is disabled in the Cloud demo; the local
+# app and the Docker image still install the full extra.
+streamlit>=1.50,<2
+plotly>=5.20
+pandas>=2.0
+numpy>=1.26
+psutil>=5.9
