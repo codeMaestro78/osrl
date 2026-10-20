@@ -1,262 +1,329 @@
 # OS-RL-Agent
 
-Local-first freeze-risk watchdog for Ubuntu: PSI-based pressure detection,
-guarded (reversible) interventions, RL as a candidate policy that must earn
-its autonomy. See `DESIGN.md` for the architecture and `DESIGN.md` §11 for
-the research-audit amendments.
+**A local-first freeze-risk watchdog for Linux.** It samples kernel pressure
+stalls (PSI), memory/swap state, and per-process telemetry every 2 seconds,
+classifies freeze risk, and permits only guarded, reversible interventions.
+Reinforcement learning is a candidate policy that must beat a measured
+baseline and pass an evaluation gate — it is never on the safety path.
 
-## Status (Phase 4.0 complete — policy evaluation + evidence pipeline)
+`Python 3.10+` · `Linux with PSI` · `222 tests` · `unprivileged by default`
 
-Implemented and tested:
+[Architecture](DESIGN.md) · [Quickstart](#quickstart) · [Dashboard](#dashboard) ·
+[Deployment](#deployment) · [Safety model](#safety-model)
 
-- **Collector core** (`osrl/collector.py`): 2 s sampling of CPU (total +
-  per-core from `cpu_times` diffs), RAM (`MemAvailable`), swap occupancy,
-  GPU via NVML when present; PSI diffing (`some`/`full`, cumulative
-  microseconds -> interval stalls); `/proc/vmstat` deltas (pswpin/pswpout,
-  pgmajfault, reclaim scan/steal, allocstall); per-process CPU/RSS for top-15
-  and heavyweight events (birth/death/pid-reuse, keyed `(pid, start_time)`).
-  Derived values are `None` when unknown -- never fabricated zeros. A
-  counter reset or an unreadable input yields `None` and resets history so
-  diffs never span outages.
-- **Store** (`osrl/store.py`): SQLite WAL (`synchronous=NORMAL`),
-  explicit-schema v1, batched short-transaction writes, ts-indexed, 15-min
-  rollups (PSI stall seconds, never raw occupancy as evidence), retention
-  (raw 7 d / events 30 d / rollups per DESIGN §7), durable heartbeat,
-  **intent channel** with `pending -> claimed -> applied/rejected/failed ->
-  expired` lifecycle, atomic single-owner claims (compare-and-set inside
-  `BEGIN IMMEDIATE`), lease reconciliation for dead claimants, poison
-  expiry at `max_tries`. The `actions_ledger` table intentionally does not
-  exist yet: it is Phase 2's schema, added with its guard semantics, not
-  pre-created.
-- **Daemon** (`osrl/daemon.py`): single-instance via flock on
-  `<db-dir>/collector.lock`, interval-paced sampling (first sample
-  immediate), batched flushes, 30 s heartbeat (with MEASURED own-CPU% via
-  `os.times` delta, **and now the current `risk_level`**), intent-lease
-  reconciliation, hourly retention prune + WAL passive checkpoint, 15-min
-  rollup windows (grid-anchored, backlog bounded to 96 windows/tick and
-  tested against multi-day outages: missing windows become dense
-  `sample_count=0` rows), graceful SIGTERM/SIGINT flush, `--once` smoke
-  mode.
-- **Identity primitives** (`osrl/procid.py`): `(pid, start_time)` equality +
-  revalidation function consumed later by the Phase 2 guard.
-- **Risk estimator** (`osrl/risk.py`, Phase 1): deterministic, sample-fed
-  classifier (`none/elevated/critical/unknown`) with a multi-condition
-  escalation rule (>=2 concurrent warn signatures OR >=1 strong signature,
-  sustained `enter_n` ticks), hysteresis on exit (`exit_n` calm ticks,
-  stepwise demotion), **missing metrics cast no vote and are never reported
-  as zero**, and a **staleness gate**: stale or future-dated telemetry
-  forces `unknown` and clears streaks. `unknown` is never conflated with
-  `elevated`; a fresh clean sample releases the wait-state. CRITICAL
-  additionally requires primary memory-PSI evidence to be present in the
-  window (secondary-only strong evidence is honestly capped at ELEVATED).
-  Level changes are recorded as `risk_change` events with the evidence
-  lists attached.
-- **PSI event triggers** (`osrl/psi_trigger.py`, Phase 1): arms real kernel
-  monitors (memory `some 150ms/2s`, io `full 50ms/2s` — windows are the
-  smallest unprivileged-legal multiple of 2 s), waits with `poll()` on
-  POLLPRI, records `psi_trigger_fired` / `psi_trigger_registered` /
-  `psi_trigger_failed` / `psi_trigger_dead` events through its **own
-  thread-local store connection**; poller failures land in the ledger as
-  `psi_poller_error` and can never take sampling down. Kernel contract was
-  probed and VERIFIED live on this machine (EBUSY on double-arm, EINVAL
-  for non-2s-multiple windows, fd close deregisters; a monitor may fire
-  immediately at arm time — fired events are treated as evidence, never
-  as errors). Memory firings add ONE bounded warn vote to the risk tracker
-  (`note_trigger`, fresh for 4 s = two windows; the kernel rate-limits to
-  one notification per window, so absence of a second notification is not
-  proof of recovery).
+---
 
-Not implemented yet (by plan): autonomous policy promotion / the remaining
-Phase 5 hardening. The Streamlit control plane now ships in
-`osrl/dashboard/`, with a Community Cloud entrypoint (see Deployment below).
+## Why PSI?
 
-### Phase 2 — guarded action infrastructure (implemented, autonomy OFF)
+CPU load alone does not explain freezes. A machine can sit at 30% CPU and
+still be unusable because it is thrashing swap or stalled on memory reclaim.
+Linux PSI (Pressure Stall Information) reports the fraction of time tasks
+were actually stalled waiting for CPU, memory, or I/O.
 
-- **pidfd** (`osrl/pidfd.py`): `os.pidfd_open`-based pinning — while held,
-  the kernel cannot recycle the pid; poll(0) reports exit; identity is
-  re-validated INSIDE the hold. The reuse window between revalidation and
-  syscall is closed by construction.
-- **Guard** (`osrl/guard.py`): deterministic first-failure-wins checker
-  (kind whitelist, pid sanity incl. never-self, (pid,start_time) identity,
-  same-uid ownership, TELEMETRY STALENESS GATE — no samples in store or
-  staleness > `staleness_max_s` hard-denies —, capability/state (see below),
-  per-(pid,kind) rate limiting where even FAILED attempts count, and the
-  intent lease: live execution consumes a claimed intent we own). The
-  guard never mutates anything and never retries; the ledger records the
-  exact one reason for a denial. Structurally RL-free (AST-import scan
-  test in `tests/test_safety_invariants.py`).
-- **Executor** (`osrl/executor.py`): the ONLY `setpriority` surface.
-  `renice_back` raises nice on same-uid targets (verified live, 0→10) and
-  verifies the postcondition by read-back. **RESTORE IS ELEVATION-ONLY BY
-  EVIDENCE**: unprivileged nice lowering returns EPERM cross-process AND
-  self (probed 2026-10-20, RLIMIT_NICE=(0,0)) — so `restore_capable=False`
-  gates it off and the guard rejects restore with
-  `restore_requires_elevation`; the Phase 4 RL action mask must mask
-  restore off whenever that capability is false. No SIGKILL/SIGSTOP
-  primitive exists anywhere in the repo.
-- **Ledger** (`osrl/store.py`, schema v2): actions_ledger gained
-  `target_nice/before_nice/applied_nice/parent_action_id/intent_id/
-  guard_checks/error/ts_applied/ts_restored` + indexes; state machine
-  proposed→approved→applied|failed (CAS updates), strict-column inserts,
-  `last_action_ts` rate-limiter query, prune with events_days. v1→v2
-  migration tested on a legacy-shaped db (rows preserved).
-- **Worker** (`osrl/worker.py`): the ONLY intent→action path. Dry mode
-  (default) peeks and adjudicates nothing claimed; execution requires the
-  operator's explicit `--execute` flag per invocation — that token is the
-  human approval gate for this phase (the daemon never imports/starts the
-  worker; enforced by test). Malformed intents are rejected with reasons;
-  invocation-limit releases claims back to pending instead of consuming
-  them (`release_claim`).
-- **Store/collector upgrades**: schema v2 also adds
-  `samples.gpu_top_procs_json` and per-process VRAM collection (NVML
-  graphics+compute clients merged per pid; verified readable live:
-  5 desktop clients with exact bytes), retained top-5 by VRAM.
-- **Heavyweight thresholds retuned from recorded evidence** (88 births /
-  0.7 h): (50% CPU, 512 MiB RSS) replaces (25, 200) — the CPU side never
-  fired for newborn processes (~0 accumulated time) and the old RSS floor
-  was pure Chrome-utility noise (median 273 MiB); the new pair keeps 13%
-  of the noise while retaining meaningful births. Both live behind
-  `OSRL_HEAVY_*` env overrides; risk thresholds behind `OSRL_RISK_*`,
-  guard behind `OSRL_GUARD_*` (tuning now needs no code edits).
+OS-RL-Agent treats **occupancy as context and pressure as evidence**. Swap
+that is 98% full with zero swap traffic and zero PSI stalls is correctly
+classified `none` — not a false alarm. Derived values are `None` when the
+kernel cannot provide them; nothing is fabricated as zero.
 
-### Phase 3 — digital twin + baselines (implemented, observe-only)
+## Status at a glance
 
-The twin is the **measurement layer** any RL policy must be able to beat;
-it is NOT a world-simulator and invents nothing. Everything scores
-(predictions from data ≤ t) against RECORDED rows at t+h.
+| Layer | What ships | State |
+| --- | --- | --- |
+| **Telemetry** | 2 s collector: CPU total/per-core, RAM, swap, PSI `some`/`full`, `/proc/vmstat` deltas, GPU via NVML, top-15 processes, birth/death events | ✅ |
+| **Storage** | SQLite WAL, schema v3: `samples`, `rollups`, `events`, `meta`, `heartbeat`, `intents`, `actions_ledger`, `rl_metrics` | ✅ |
+| **Risk** | `none` / `elevated` / `critical` / `unknown`, multi-signal escalation, hysteresis, staleness gate, PSI evidence requirement | ✅ |
+| **Actions** | `renice_back` only, behind `worker → guard → pidfd → executor → ledger` | ✅ gated; `--execute` required |
+| **Twin** | Session slicing, `noop`/`hold`/`linear`/`ewma`/`rolling-median` baselines, 30/60/120 s evaluation, renice forward model | ✅ abstains below 8 real pairs |
+| **RL** | Gymnasium env, action masking, multi-term reward, MaskablePPO training, inference/intent bridge | ✅ training; **no validated policy** |
+| **Dashboard** | Six-page Streamlit control plane | ✅ local + Cloud demo |
+| **Deployment** | systemd units, Docker/supervisord, Fly/Render/Railway configs, Streamlit Cloud demo | ✅ |
 
-- **Session slicing** (`osrl/twin.py`): telemetry is cut into sessions
-  wherever a sample gap exceeds `max(3× median interval, 10 s)` — no
-  prediction is ever asked to bridge a daemon outage; every baseline
-  restarts fresh per session. Missing metrics stay missing (None), and
-  every score publishes its own coverage (`n_pairs`, `n_abstained`).
-- **Baseline registry**: `noop` (always abstains — the floor),
-  `hold` (persistence: last observed value), `linear` (OLS trailing-window
-  trend with per-feature abstention until ≥3 points spanning the window).
-- **Causal evaluation harness**: targets matched nearest-first within 1%
-  of the sampling interval, never interpolated, never across sessions;
-  horizons 30/60/120 s; mae/bias computed only over (predicted, recorded)
-  pairs both sides real values.
-- **Renice forward model** (spec `SPEC_RENICE_TWIN`): action-conditioned
-  difference-in-differences over applied ledger rows vs matched pre/post
-  windows; **needs 8 real pairs, has 0, so it abstains on every
-  prediction** (`insufficient-real-evidence(0<8)`) — the same honest
-  refusal as the staleness gate, no fabricated effect sizes.
-- **Report CLI**: `osrl-twin --db PATH [--horizons 30,60,120]` prints a
-  JSON report; both console scripts (`osrl-collector`, `osrl-twin`) are
-  now exercised after a fresh `pip install -e .`.
+**Deliberately not enabled**
 
-**Measured on the real hold-test bank** (1.78 h continuous, 223 samples,
-single session; timestamp jitter ±0.0003 s): hold beats linear at
-essentially every horizon/feature (details in DESIGN.md §14.4) — e.g.
-cpu MAE 1.66% vs 1.82% at 30 s, 2.14% vs 2.50% at 60 s, 2.59% vs 3.45%
-at 120 s; psi stall-ratio MAE ~2e-4 (hold). On a mean-reverting,
-mostly-idle desktop, persistence is the number to beat, so the Phase 4
-acceptance bar is *beat-hold on this harness*, not beat-noop.
+- No autonomous enforcement. The daemon never starts the worker; the only
+  target-mutation path is the worker CLI with an explicit `--execute` flag.
+- No `SIGKILL`, `SIGSTOP`, or termination primitive exists anywhere.
+- `nice` lowering (restore) is blocked: unprivileged lowering returns `EPERM`
+  both cross-process and for self, so `restore_capable=False`.
+- No policy is promoted. Training runs produce local checkpoints, but none has
+  passed the evaluation gate (all `UNVALIDATED`), and the inference bridge is
+  not started by the daemon.
+- `unknown` is never conflated with `elevated`, and missing metrics cast no vote.
 
-### Phase 4.0 — policy evaluation + evidence pipeline (implemented)
+## Architecture
 
-- **Candidate forecasters** (`ewma`, `rolling-median`) added to the
-  registry; beat-hold verdict is now MEASURED, not asserted (DESIGN
-  §15.1): rolling-median wins the bursty stress features (psi stall
-  ratio, swap-out rate, allocstall) by ~2-3x; hold wins the level
-  features (mem available, swap occupancy, cpu total). The Phase 4 bar
-  is now the per-feature blend — and one binding caveat: the median is
-  burst-blind, so alarm inputs must stay hold/max-shaped.
-- **Policy-level evaluation** (`osrl/policy_eval.py`): alarm policies
-  scored against a frozen mechanical event labeler (≥3 consecutive
-  critical samples; outages never bridged). Shipped comparison:
-  deployed risk tracker (replayed unchanged, real `Sample`
-  reconstruction) vs a naive single-sample threshold strawman.
-  Hysteresis demonstrably buys 1 fewer false-alarm run on a labeled
-  scenario at a documented latency cost (18 s at defaults). Zero-event
-  banks report recall=None (unmeasurable), never 0/0 coerced.
-- **Forward-model evidence pipeline**: applied ledger rows are matched
-  with ±60 s telemetry (target CPU share via top-15 (pid, start_time)
-  identity, per-side tick floor, unusable windows REPORTED not
-  interpolated); `ReniceForwardModel` now counts usable pairs, fits a
-  median shift, activates at ≥8 pairs, refuses horizon mismatch /
-  non-positive deltas, stamps every forecast UNVALIDATED.
-- **Live validation** on a dedicated 2 s experiment bank (shipped
-  default thresholds only — no env overrides): 2 operator-owned busy
-  children pinned to one core; both intents dry-peeked first, then run
-  through the standard worker `--execute` gate. Result (median shares
-  of machine total): reniced child 4.17%→0.79% while its contender
-  rose 4.17%→7.52% (one-core conservation), then both reniced →
-  4.17/4.17 again. The renice mechanism is live-verified in both
-  directions.
-- **Defect found by the pipeline** (not by review): the worker never
-  recorded `before_nice`, so ledger `nice_delta` was always NULL.
-  Fixed and test-locked; the two actions taken before the fix stay
-  delta-NULL in history (not retro-fitted).
-- Model state: 1 usable pair < 8 → still abstains everywhere (fit
-  summary publishes n=1 shift −3.35 points with the caveat). PPO
-  remains correctly deferred: no policy has beaten the blend, and the
-  recorded bank contains zero events to learn from.
-
-## Quickstart (this repo)
-
-```bash
-python3 -m venv .venv
-./.venv/bin/pip install -q psutil nvidia-ml-py pytest ruff  # dev install
-./.venv/bin/pip install -e .                                 # optional: CLI entry
-./.venv/bin/pip install -e ".[dashboard]"                    # optional: Streamlit UI
-
-./.venv/bin/python -m pytest -q          # full test suite (169 tests)
-./.venv/bin/python -m osrl.daemon --db data/telemetry.db --once   # smoke
-./.venv/bin/python -m osrl.daemon --db data/telemetry.db         # run forever
-
-# Intents -> actions worker: DRY by default; --execute is the explicit
-# per-invocation human approval gate (the daemon NEVER runs this)
-./.venv/bin/python -m osrl.worker --db data/telemetry.db          # dry peek
-./.venv/bin/python -m osrl.worker --db data/telemetry.db --execute
-
-# Digital twin: evaluate baseline forecasters over recorded telemetry
-./.venv/bin/osrl-twin --db data/telemetry.db --horizons 30,60,120
-
-# Dashboard: live local collector data, then open http://localhost:8501
-./.venv/bin/osrl-dashboard --db data/telemetry.db
-# (or the Cloud entrypoint, which auto-selects live/demo DB)
-./.venv/bin/streamlit run streamlit_app.py
+```text
+ /proc/pressure/*   /proc/vmstat   psutil   NVML
+          \             |            |       /
+           \            v            v      /
+            +------ osrl-collector (2 s) ---+
+                            |
+                            v
+                 SQLite WAL store (schema v3)
+                 ├── samples / rollups / events / heartbeat
+                 ├── intents ──► osrl.worker ──► guard ──► pidfd
+                 │                                        │
+                 │                                        v
+                 │                                   executor (setpriority)
+                 │                                        │
+                 │                                        v
+                 │                                  actions_ledger
+                 └── twin / policy_eval / RL training
+                            |
+                            v
+                  osrl-dashboard (Streamlit)
 ```
 
-Configuration via environment (see `osrl/config.py`): `OSRL_DB`,
-`OSRL_INTERVAL`, `OSRL_RAW_DAYS`, `OSRL_ROLLUP_SECONDS`, `OSRL_HEARTBEAT_S`,
-`OSRL_BATCH_SIZE`, `OSRL_BATCH_INTERVAL_S`, `OSRL_WAL_CHECKPOINT_S`.
-Defaults follow DESIGN §7 (2 s cadence, 7 d raw, 15-min rollups kept).
-Risk/trigger thresholds are code-level defaults in
-`osrl.config.{RiskConfig,PsiTriggerConfig}` (hypotheses to retune on data;
-PSI-trigger windows must stay multiples of 2 s for unprivileged monitors).
+**Structural safety invariants** (enforced by tests in
+`tests/test_safety_invariants.py`):
 
-## Deploy the dashboard on Streamlit Community Cloud
+1. `osrl.guard`, `osrl.worker`, `osrl.executor`, `osrl.pidfd`, and
+   `osrl.daemon` never import `osrl.rl` or `osrl.dashboard`.
+2. `osrl.daemon` never imports or starts the worker.
+3. The guard chain never imports `torch`, `gymnasium`, or `stable-baselines3`.
+4. The only module permitted to mutate process priority is
+   `osrl/executor.py` (via `psutil.Process.nice`, which maps to the
+   `setpriority` syscall).
 
-Streamlit Community Cloud runs only the Streamlit process — it cannot read
-your laptop's `/proc`, run the collector daemon, or keep a SQLite file across
-restarts. The Cloud deployment therefore replays a **compact recording of real
-telemetry** (`data/demo_telemetry.db`, 7 h / 12k samples from this workstation)
-and labels itself as a snapshot in the UI.
+## Requirements
 
-**Files that make it work**
+- **Linux with PSI** — `/proc/pressure/{cpu,memory,io}` (kernel 4.20+;
+  verified on Ubuntu 24.04, kernel 7.0).
+- **Python 3.10+**.
+- Optional: NVIDIA GPU + NVML for GPU utilization, VRAM, temperature, power.
+- No root required for the shipped `renice_back` path.
+- Streamlit Community Cloud is supported for the **recorded demo UI only** —
+  it cannot read your host's `/proc` or run the collector.
+
+## Quickstart
+
+```bash
+git clone https://github.com/codeMaestro78/osrl.git
+cd osrl
+
+python3 -m venv .venv
+./.venv/bin/pip install -e ".[dashboard]"      # core + Streamlit UI
+
+# Smoke test (first tick writes NULL for derived rates)
+./.venv/bin/python -m osrl.daemon --db data/telemetry.db --once
+
+# Run the collector forever
+./.venv/bin/python -m osrl.daemon --db data/telemetry.db
+```
+
+In a second terminal:
+
+```bash
+./.venv/bin/osrl-dashboard --db data/telemetry.db
+# open http://localhost:8501
+```
+
+Alternatively, `./.venv/bin/streamlit run streamlit_app.py` uses the same
+entrypoint as the Cloud demo and auto-selects a live or recorded database.
+
+For development and tests:
+
+```bash
+./.venv/bin/pip install -e ".[dev,dashboard]"
+./.venv/bin/python -m pytest -q        # 222 tests
+```
+
+For RL training (installs PyTorch, Gymnasium, SB3):
+
+```bash
+./.venv/bin/pip install -e ".[dev,dashboard,rl]"
+```
+
+## Dashboard
+
+The Streamlit control plane auto-refreshes its fragments; data comes from the
+same SQLite store the collector writes.
+
+| Page | Contents |
+| --- | --- |
+| **Overview** | Risk status, live gauges, PSI stalls, 5-minute charts, event stream |
+| **Processes** | Top CPU/RSS, top-10 memory consumers, per-core distribution, process events, action ledger |
+| **Data Explorer** | Auto-train status, dataset coverage, feature distributions, correlations, raw sample browser |
+| **Agent** | Mode gate (observe/advise/autopilot), checkpoint status, reward history, action ledger |
+| **Training** | Reward curves, reward-term breakdown, checkpoint manager, training launcher, live log |
+| **History** | 15-minute rollups, 7-day trends, hour-of-day CPU heatmap, full event log |
+
+The Cloud demo disables the training launcher and labels itself as a recorded
+snapshot. See [Streamlit Community Cloud](#streamlit-community-cloud-recorded-demo).
+
+## Guarded actions
+
+The worker is the **only** intent → action path. Dry mode is the default:
+
+```bash
+./.venv/bin/python -m osrl.worker --db data/telemetry.db          # dry peek
+./.venv/bin/python -m osrl.worker --db data/telemetry.db --execute
+```
+
+Intent lifecycle:
+
+```text
+pending → claimed → applied | rejected | failed | expired
+```
+
+Ledger lifecycle:
+
+```text
+proposed → approved → applied | rejected | failed | restored | expired
+```
+
+The guard is deterministic and first-failure-wins: kind whitelist, pid sanity
+(never self), `(pid, start_time)` identity, same-uid ownership, telemetry
+staleness gate, per-`(pid, kind)` rate limiting (failed attempts count), and a
+live intent lease. It never mutates, never retries, and records exactly one
+denial reason.
+
+The dashboard currently **does not write or approve intents** — it displays
+state and sets the mode flag. `osrl/rl/inference.py` is a library bridge that
+can write intents when invoked; nothing starts it automatically.
+
+## Evaluation and RL
+
+### Digital twin
+
+```bash
+./.venv/bin/osrl-twin --db data/telemetry.db --horizons 30,60,120
+```
+
+Prints a JSON report with per-baseline coverage (`n_pairs`, `n_abstained`),
+MAE, and bias. Sessions are cut wherever a sample gap exceeds
+`max(3 × median interval, 10 s)`, so no prediction bridges a daemon outage.
+The renice forward model requires **8 usable real pairs**; below that it
+abstains rather than inventing an effect size.
+
+### Training (optional)
+
+```bash
+./.venv/bin/osrl-train --db data/telemetry.db --steps 100000 --synthetic
+./.venv/bin/osrl-train --db data/telemetry.db --eval-only
+```
+
+- One RL step = one 20 s decision window (10 samples at 2 s).
+- Action space: `NOOP`, `ALERT`, `RENICE_BACK`, `REQUEST_APPROVAL`,
+  `TUNE_THRESHOLDS`.
+- Observation: 114 floats = 57 features + 57 validity-mask bits.
+- Reward terms: PSI (memory/IO/CPU), swap-out, swap urgency, memory headroom,
+  swap free, foreground share, OOM risk, stability, trend, action cost.
+- Training is CPU-only and re-nices itself `+10` so it does not compete with
+  the desktop.
+- Checkpoints are named `ckpt_stepNNNNNNNN_VALIDATED` or
+  `..._UNVALIDATED`; `best` is a symlink to the best evaluated checkpoint.
+- Promotion gate: mean eval reward must beat the NOOP baseline by 5%
+  (`EVAL_GATE_REWARD_RATIO = 0.05`).
+
+**Current state:** training runs produce checkpoints locally, but none has
+passed the gate (all `UNVALIDATED`); no checkpoint is shipped with the
+repository. Inference supports `observe`, `advise`, and `autopilot` gates, but
+it is not started by the daemon; even `autopilot` intents still require the
+worker, guard, and executor.
+
+### Auto-training scheduler
+
+```bash
+./.venv/bin/osrl-auto-train --db data/telemetry.db \
+    --interval 3600 --min-samples 500
+```
+
+Defaults: poll every 60 s, require 500 new samples and at least 1 hour between
+runs, 50k steps per run, resume from `best`.
+
+## Configuration
+
+All knobs live in `osrl/config.py` and can be overridden with environment
+variables. The most useful:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OSRL_DB` | `~/os-rl-agent/data/telemetry.db` | SQLite database path |
+| `OSRL_INTERVAL` | `2.0` | Collector sample period (seconds) |
+| `OSRL_RAW_DAYS` | `7` | Raw sample retention |
+| `OSRL_EVENTS_DAYS` | `30` | Event retention |
+| `OSRL_ROLLUP_SECONDS` | `900` | Rollup window |
+| `OSRL_HEARTBEAT_S` | `30` | Daemon heartbeat period |
+| `OSRL_BATCH_SIZE` / `OSRL_BATCH_INTERVAL_S` | `10` / `10` | Write batching |
+| `OSRL_WAL_CHECKPOINT_S` | `3600` | WAL checkpoint period |
+| `OSRL_HEAVY_CPU_PCT` / `OSRL_HEAVY_RSS_MIB` | `50` / `512` | Heavyweight birth thresholds |
+| `OSRL_RISK_*` | see `config.py` | Risk thresholds, enter/exit streaks, staleness |
+| `OSRL_GUARD_*` | see `config.py` | Guard staleness, rate limit, restore capability |
+| `OSRL_RL_*` | see `config.py` | Obs window, training steps, eval gate, synthetic stress |
+
+PSI trigger windows must remain multiples of 2 seconds for unprivileged
+monitors. Defaults follow `DESIGN.md` §7 (2 s cadence, 7-day raw retention,
+15-minute rollups).
+
+## Deployment
+
+### Local systemd
+
+```bash
+./deploy/install-services.sh
+```
+
+Installs and starts `osrl-collector`, `osrl-dashboard`, and
+`osrl-auto-train` as user services. The auto-train unit needs the `rl` extra;
+disable it if you have not installed `.[rl]`.
+
+### Remote access without a cloud host
+
+```bash
+./deploy/cloudflare-tunnel.sh
+```
+
+Starts a quick Cloudflare tunnel to `http://localhost:8501`. This is the
+lowest-latency way to view **your own machine** remotely (2 s freshness).
+The quick-tunnel URL changes on restart; use a named tunnel for a stable
+domain. The laptop must stay awake and online.
+
+### Docker / cloud VM
+
+```bash
+docker build -t osrl .
+docker run --rm -p 8501:8501 -v osrl_data:/data osrl
+```
+
+The image runs the collector and dashboard together under `supervisord`, with
+the database on the `/data` volume. Ready-made configs:
+
+- `fly.toml` — Fly.io, Mumbai region, persistent volume
+- `render.yaml` — Render, 5 GB disk
+- `railway.json` — Railway, Docker builder
+
+This is genuinely live, but it monitors the **container/VM it runs in**, not
+your laptop. On Linux you can add `--pid=host` to see host processes, though
+cgroup limits still apply.
+
+### Streamlit Community Cloud (recorded demo)
+
+Streamlit Community Cloud runs only the Streamlit process. It has no cron, no
+daemon, no persistent disk, and no access to your laptop's `/proc`. The Cloud
+deployment therefore replays a compact recording of real telemetry and labels
+itself as a snapshot in the UI.
+
+**What gets deployed**
 
 | File | Purpose |
 | --- | --- |
-| `streamlit_app.py` | Cloud entrypoint (repo root); resolves the DB and imports the dashboard |
-| `requirements.txt` | Dashboard-only deps (no torch / stable-baselines3 — keeps the build ~1 GB smaller) |
-| `osrl/dashboard/bootstrap.py` | DB resolution: `OSRL_DB` → local live DB → bundled snapshot → empty store |
-| `data/demo_telemetry.db` | Recorded snapshot, copied to `/tmp` at startup so writes never touch the repo |
-| `.streamlit/config.toml` | Dark theme + headless server defaults |
+| `streamlit_app.py` | Cloud entrypoint; resolves the DB before the dashboard imports its cached connection |
+| `requirements.txt` | Dashboard-only dependencies (no torch / SB3, keeping the Cloud build small) |
+| `osrl/dashboard/bootstrap.py` | DB resolution: `OSRL_DB` → local live DB → bundled snapshot → empty v3 store |
+| `data/demo_telemetry.db` | ≈7 h / 12k-sample recording, copied to `/tmp` at startup |
+| `.streamlit/config.toml` | Dark theme and headless defaults |
 
 **Deploy**
 
 1. Push the repo to GitHub (public, or private with Streamlit's GitHub app
-   granted access). The snapshot must be committed — `.gitignore` already has
-   an exception for `data/demo_telemetry.db`.
-2. Go to <https://share.streamlit.io> → **New app** → pick the repo/branch.
-3. Set **Main file path** to `streamlit_app.py`.
-4. Optional: choose Python 3.12 in **Advanced settings**. No secrets are
-   required.
-5. Deploy. Startup copies the snapshot to `/tmp/osrl-dashboard/demo.db` and
-   opens on the Overview page.
+   granted access). `.gitignore` already carries an exception for
+   `data/demo_telemetry.db`.
+2. Open <https://share.streamlit.io> → **Create app** → **Yup, I have an app**.
+3. Repository `codeMaestro78/osrl`, branch `main`, main file path
+   `streamlit_app.py`.
+4. Python 3.12 is the default; no secrets are required.
+5. Deploy. Startup copies the snapshot to `/tmp/osrl-dashboard/demo.db`.
 
 **Regenerate the snapshot** after collecting more telemetry:
 
@@ -267,76 +334,140 @@ python deploy/build_demo_db.py \
     --hours 24 --max-procs 8
 ```
 
-The builder preserves schema version, rollups, events, and ledger rows; it
-only trims old samples and compacts per-process JSON.
+The builder uses SQLite's backup API (safe while the collector writes),
+preserves schema version/rollups/events/ledger rows, trims old samples,
+compacts per-process JSON, and sanitizes `/home/<user>/` paths.
 
-**Cloud limitations (by design, not bugs)**
+**Cloud limitations (by design)**
 
-- Live metrics are from the recording, not the Cloud container. The banner
-  says so; the Overview card reads **Dataset → Recorded**.
-- Agent mode changes, rollups, and intents persist only for the life of the
-  container (ephemeral filesystem).
-- Training launches are disabled: the Cloud build intentionally omits torch.
-- For genuine live monitoring use the local dashboard (`osrl-dashboard`), the
-  systemd units in `deploy/`, or the Docker image (`Dockerfile`) on Fly.io /
-  Render / Railway, where the collector and dashboard run together under
-  supervisord.
+- Metrics are from the recording, not the Cloud container. The banner says
+  **recorded demo snapshot** and the Overview card reads **Dataset → Recorded**.
+- Mode changes, rollups, and intents last only for the container's lifetime.
+- Training launches are disabled because the Cloud build omits torch.
+- The app sleeps after inactivity; the snapshot does not advance.
 
-## Measured on the live workstation (2026-10-20)
+**Keeping the Cloud URL updated**
 
-### Phase 2 live verification (guarded execution)
+Cron cannot run inside Streamlit Cloud. The scheduler must run on the machine
+that can see `/proc`:
 
-- Full intent→claim→guard→pidfd→apply→ledger chain against a real child
-  process owned by the operator account: renice_back 0→10 applied and
-  read-back verified; the store staleness gate saw 0.2 s fresh telemetry.
-- Negative paths held live: a second renice_back 0 s later was
-  rate-limit-rejected (300 s spacing; the FAILED rows count too), and a
-  restore intent citing the real applied parent row was rejected with
-  `restore_requires_elevation` — target untouched.
-- CLI path: `python -m osrl.worker --db ... --execute` exited 0 with an
-  applied JSON summary; dry mode consumed nothing.
-- Ledger: exactly one row per intent (`approved`→`applied` or
-  `rejected`), guard_checks JSON recorded per row, intents consumed
-  exactly once (3 pending → 0 pending).
+| Approach | Freshness | Trade-off |
+| --- | --- | --- |
+| **Local dashboard + Cloudflare Tunnel** | ~2 s | Laptop must be awake; no Streamlit Cloud |
+| **Cron/systemd timer publishes a compact DB** to R2/S3/Supabase/VPS; Cloud app would fetch it | 1–15 min | Needs object storage + a small `OSRL_REMOTE_DB_URL` fetch bridge (not implemented yet) |
+| **Remote database** (Postgres/Supabase/Turso) | seconds | Requires a data-access refactor away from the SQLite driver |
+| **GitHub Actions cron committing the DB** | minutes | Not recommended: the runner cannot see your laptop, and large DB commits bloat the repo and redeploy constantly |
 
-### Collector measurements (unchanged from Phase 1)
-- 2.000 s cadence ± 0.2 ms; collector's own CPU 0.15% (heartbeat payload,
-  `os.times` delta) -- under the 1% budget. Worst single-tick collection
-  80 ms wall on ~450 processes (burst, not sustained CPU). Phase 2 smoke:
-  own CPU 0.25%, heartbeat carries `pending_intents` and `risk_level`.
-- ~7 KB/sample with WAL truncation: one day of raw 2 s data ~= 300 KB, so
-  the 7-day raw retention window is a few MB -- measured, not assumed.
-- Non-toxic data: first tick rates are NULL; swap traffic (pages/s) only
-  populated from the second tick; a reboot or dead /proc read yields NULL
-  rather than a negative/fabricated value.
-- Phase 1 triggers under real desktop load: both monitors armed and fired
-  naturally (io `full` 3-4x, memory `some` 0-1x per ~55 s run) and each
-  firing produced a ledger event; the risk level stayed `none` (single
-  warn votes do not escalate -- no false alarms). Swap 98% occupied with
-  ZERO swap traffic and zero PSI stalls correctly classified `none`:
-  occupancy is not thrashing.
-- Per-process VRAM (Phase 2): NVML graphics-class list exposed 5 desktop
-  clients with exact per-pid bytes; merged compute/graphics top-5 persisted.
+A `--once` collector run from cron is also a trap: the first tick has no
+previous counters, so CPU%, swap rates, and PSI deltas are `None`. Keep the
+2-second collector as a service; use cron only for publishing.
 
-## Safety posture now
+## Data model
 
-- Guarded but gated: the ONLY live mutation path is the worker CLI in
-  explicit `--execute` mode, consuming intents you (or a future dashboard)
-  insert. The autonomous path does not exist: the daemon never starts the
-  worker (enforced by test), the guard's staleness/rate/ownership/
-  capability checks all widen the denial set, and RL never touches
-  enforcement (enforced by AST-import test).
-- restore is evidence-capped: raising nice is unprivileged-safe and was
-  verified live; lowering it back is EPERM unprivileged (cross-process AND
-  self, probed twice) so `restore_capable=False` until an elevated helper
-  is deliberately configured — never silently.
-- No SIGKILL/SIGSTOP/termination primitive exists anywhere; renice_back is
-  verified monotonic (never raises priority), postcondition-read-back
-  enforced, and pidfd-pinned against pid reuse.
-- Observe mode remains the default; nothing ran autonomously in any smoke
-  — all executions in this repo's history targeted test children owned by
-  the operator account, with every intent→ledger row auditable in the
-  store.
-- The intent channel's executable semantics now exist (via the worker);
-  the dashboard (Phase 5) will write intents through the same audited
-  channel, behind the same explicit gates.
+| Table | Purpose |
+| --- | --- |
+| `samples` | One row per 2 s tick: CPU, memory, swap, PSI deltas, vmstat rates, GPU, per-process JSON |
+| `rollups` | 15-minute windows (stall seconds, averages/maxima); missing windows stay dense with `sample_count=0` |
+| `events` | Risk changes, PSI trigger firings, process births/deaths, training metrics, scheduler events |
+| `heartbeat` | Single-row durable daemon heartbeat with measured own-CPU% and `risk_level` |
+| `meta` | `agent_mode`, rollup cursor, demo-snapshot metadata |
+| `intents` | Durable intent channel with atomic single-owner claims and expiry |
+| `actions_ledger` | Proposed → approved → applied/failed audit trail with guard checks |
+| `rl_metrics` | Reserved for structured RL metrics (training events currently go to `events`) |
+
+Retention: raw samples 7 days, events and ledger rows 30 days, rollups
+retained. A reboot or unreadable `/proc` read yields `NULL` and resets the
+relevant counter history, so diffs never span outages.
+
+## Measured evidence (2026-10-20, Ubuntu 24.04)
+
+- Collector cadence **2.000 s ± 0.2 ms**; own CPU **0.15–0.25%**; worst single
+  tick **80 ms** on ~450 processes. Both metrics stay under the 1% budget.
+- Storage: **~4 KB/sample** in this recording (≈170 MB/day at 2 s); WAL
+  checkpoints plus 7-day retention bound disk use.
+- Digital twin on a 1.78 h / 223-sample bank: `hold` beats `linear` at
+  30/60/120 s — CPU MAE **1.66 vs 1.82**, **2.14 vs 2.50**, **2.59 vs 3.45**.
+- `rolling-median` wins bursty stress features (PSI stall ratio, swap-out,
+  allocstall) by **2–3×**; `hold` wins level features (memory available, swap
+  occupancy, CPU total). The Phase 4 bar is the per-feature blend.
+- Live renice validation on a 2 s experiment bank: reniced child
+  **4.17% → 0.79%**, contender **4.17% → 7.52%** (one-core conservation);
+  both reniced → **4.17/4.17**.
+- Forward model: **1 usable pair < 8**, so it abstains everywhere; the fit
+  summary publishes `n=1` with the caveat rather than an effect size.
+- Policy evaluation: hysteresis removed one false-alarm run on the labeled
+  scenario at a documented **18 s** latency cost.
+
+## Safety model
+
+- **Guarded but gated.** The only live target-mutation path is the worker CLI
+  in explicit `--execute` mode, consuming intents from the audited channel.
+- **RL is structurally outside enforcement.** The guard chain never imports
+  RL/dashboard modules (AST test), and the daemon never starts the worker
+  (test).
+- **Restore is evidence-capped.** Raising `nice` is unprivileged-safe and
+  read-back verified; lowering it returns `EPERM` unprivileged (cross-process
+  and self), so `restore_capable=False` until an elevated helper is
+  deliberately configured.
+- **No termination primitives.** No `SIGKILL`, `SIGSTOP`, or kill path exists;
+  `renice_back` is monotonic and pidfd-pinned against pid reuse.
+- **Observe remains the default.** Every execution in this repo's history
+  targeted operator-owned test children, with an auditable intent → ledger row.
+- **Honest abstention.** Stale telemetry, missing metrics, insufficient
+  evidence, and unvalidated checkpoints produce `unknown`/abstain — never a
+  fabricated number.
+
+## Repository layout
+
+```text
+osrl/
+  collector.py      # 2 s sampler and process events
+  store.py          # SQLite schema v3, intents, ledger, rollups
+  daemon.py         # single-instance collector service
+  risk.py           # deterministic risk classifier + hysteresis
+  psi_trigger.py    # kernel PSI monitors (poll/POLLPRI)
+  guard.py          # post-action veto, first failure wins
+  worker.py         # intent -> action; dry by default
+  executor.py       # the only priority-mutation surface
+  pidfd.py          # pid pinning against reuse
+  twin.py           # session slicing, baselines, forward model
+  policy_eval.py    # alarm-policy evaluation against frozen labels
+  rl/               # env, obs, mask, reward, train, inference, auto_train
+  dashboard/        # Streamlit app, pages, shared helpers, bootstrap
+deploy/             # systemd units, Docker/supervisord, tunnel, demo builder
+tests/              # 222 tests: collector, store, guard, twin, RL, safety
+```
+
+## Known limitations
+
+- Linux/PSI only; tuned on a mostly-idle Ubuntu desktop.
+- One action primitive (`renice_back`); restore needs elevation.
+- No validated policy is promoted, and RL inference is not continuously run.
+- The dashboard does not write/approve intents yet; the worker CLI does.
+- Event scarcity: synthetic stress is a curriculum aid, not evidence.
+- Streamlit Cloud is a recorded demo unless a live-data bridge or tunnel is
+  added.
+
+**Next steps:** policy validation + human approval UI, a remote live-data
+bridge for Cloud, an optional elevated restore helper, and a broader (still
+guarded) action set.
+
+## Implementation records
+
+`DESIGN.md` carries the phase-by-phase engineering record and research audit:
+
+- §11 — research-audit amendments
+- §12 — Phase 1: risk estimator and the PSI-trigger kernel contract
+- §13 — Phase 2: guard, pidfd, the restore-capability finding, schema v2
+- §14 — Phase 3: twin measurements and forward-model abstention
+- §15 — Phase 4: policy evaluation, evidence pipeline, live validation
+
+The Git history is also organized by phase. The later RL stack, dashboard,
+and deployment work is documented in this README and the commit history.
+
+## References
+
+- [`DESIGN.md`](DESIGN.md) — architecture, autonomy ladder, research audit
+  (§11), twin measurements (§14.4), policy evaluation (§15.1).
+- [Linux PSI documentation](https://docs.kernel.org/accounting/psi.html)
+- [Streamlit Community Cloud docs](https://docs.streamlit.io/deploy/streamlit-community-cloud)
