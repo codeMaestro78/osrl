@@ -66,8 +66,9 @@ Implemented and tested:
   one notification per window, so absence of a second notification is not
   proof of recovery).
 
-Not implemented yet (by plan): digital twin + baselines (Phase 3), Gym env
-+ MaskablePPO (Phase 4), Streamlit control plane (Phase 5).
+Not implemented yet (by plan): autonomous policy promotion / the remaining
+Phase 5 hardening. The Streamlit control plane now ships in
+`osrl/dashboard/`, with a Community Cloud entrypoint (see Deployment below).
 
 ### Phase 2 — guarded action infrastructure (implemented, autonomy OFF)
 
@@ -199,6 +200,7 @@ acceptance bar is *beat-hold on this harness*, not beat-noop.
 python3 -m venv .venv
 ./.venv/bin/pip install -q psutil nvidia-ml-py pytest ruff  # dev install
 ./.venv/bin/pip install -e .                                 # optional: CLI entry
+./.venv/bin/pip install -e ".[dashboard]"                    # optional: Streamlit UI
 
 ./.venv/bin/python -m pytest -q          # full test suite (169 tests)
 ./.venv/bin/python -m osrl.daemon --db data/telemetry.db --once   # smoke
@@ -211,6 +213,11 @@ python3 -m venv .venv
 
 # Digital twin: evaluate baseline forecasters over recorded telemetry
 ./.venv/bin/osrl-twin --db data/telemetry.db --horizons 30,60,120
+
+# Dashboard: live local collector data, then open http://localhost:8501
+./.venv/bin/osrl-dashboard --db data/telemetry.db
+# (or the Cloud entrypoint, which auto-selects live/demo DB)
+./.venv/bin/streamlit run streamlit_app.py
 ```
 
 Configuration via environment (see `osrl/config.py`): `OSRL_DB`,
@@ -220,6 +227,60 @@ Defaults follow DESIGN §7 (2 s cadence, 7 d raw, 15-min rollups kept).
 Risk/trigger thresholds are code-level defaults in
 `osrl.config.{RiskConfig,PsiTriggerConfig}` (hypotheses to retune on data;
 PSI-trigger windows must stay multiples of 2 s for unprivileged monitors).
+
+## Deploy the dashboard on Streamlit Community Cloud
+
+Streamlit Community Cloud runs only the Streamlit process — it cannot read
+your laptop's `/proc`, run the collector daemon, or keep a SQLite file across
+restarts. The Cloud deployment therefore replays a **compact recording of real
+telemetry** (`data/demo_telemetry.db`, 7 h / 12k samples from this workstation)
+and labels itself as a snapshot in the UI.
+
+**Files that make it work**
+
+| File | Purpose |
+| --- | --- |
+| `streamlit_app.py` | Cloud entrypoint (repo root); resolves the DB and imports the dashboard |
+| `requirements.txt` | Dashboard-only deps (no torch / stable-baselines3 — keeps the build ~1 GB smaller) |
+| `osrl/dashboard/bootstrap.py` | DB resolution: `OSRL_DB` → local live DB → bundled snapshot → empty store |
+| `data/demo_telemetry.db` | Recorded snapshot, copied to `/tmp` at startup so writes never touch the repo |
+| `.streamlit/config.toml` | Dark theme + headless server defaults |
+
+**Deploy**
+
+1. Push the repo to GitHub (public, or private with Streamlit's GitHub app
+   granted access). The snapshot must be committed — `.gitignore` already has
+   an exception for `data/demo_telemetry.db`.
+2. Go to <https://share.streamlit.io> → **New app** → pick the repo/branch.
+3. Set **Main file path** to `streamlit_app.py`.
+4. Optional: choose Python 3.12 in **Advanced settings**. No secrets are
+   required.
+5. Deploy. Startup copies the snapshot to `/tmp/osrl-dashboard/demo.db` and
+   opens on the Overview page.
+
+**Regenerate the snapshot** after collecting more telemetry:
+
+```bash
+python deploy/build_demo_db.py \
+    --src data/telemetry.db \
+    --dst data/demo_telemetry.db \
+    --hours 24 --max-procs 8
+```
+
+The builder preserves schema version, rollups, events, and ledger rows; it
+only trims old samples and compacts per-process JSON.
+
+**Cloud limitations (by design, not bugs)**
+
+- Live metrics are from the recording, not the Cloud container. The banner
+  says so; the Overview card reads **Dataset → Recorded**.
+- Agent mode changes, rollups, and intents persist only for the life of the
+  container (ephemeral filesystem).
+- Training launches are disabled: the Cloud build intentionally omits torch.
+- For genuine live monitoring use the local dashboard (`osrl-dashboard`), the
+  systemd units in `deploy/`, or the Docker image (`Dockerfile`) on Fly.io /
+  Render / Railway, where the collector and dashboard run together under
+  supervisord.
 
 ## Measured on the live workstation (2026-10-20)
 
