@@ -1,0 +1,23 @@
+[Unit]
+Description=OS-RL-Agent Auto-Training Scheduler
+After=network.target osrl-collector@%i.service
+Wants=osrl-collector@%i.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/os-rl-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/%i/os-rl-agent/.venv/bin/python -m osrl.rl.auto_train \
+    --db /home/%i/os-rl-agent/data/telemetry.db \
+    --steps 50000 \
+    --synthetic \
+    --min-samples 500 \
+    --interval 3600 \
+    --poll 60
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

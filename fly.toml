@@ -1,0 +1,39 @@
+app = "os-rl-agent"
+primary_region = "bom"  # Mumbai — closest to India
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  OSRL_DB = "/data/telemetry.db"
+  PYTHONUNBUFFERED = "1"
+
+[[mounts]]
+  source = "osrl_data"
+  destination = "/data"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8501
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[checks]
+  [checks.alive]
+    grace_period = "30s"
+    interval = "15s"
+    method = "GET"
+    path = "/"
+    protocol = "http"
+    timeout = "10s"

@@ -1,0 +1,20 @@
+[Unit]
+Description=OS-RL-Agent Telemetry Collector
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/os-rl-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/%i/os-rl-agent/.venv/bin/python -m osrl.daemon \
+    --db /home/%i/os-rl-agent/data/telemetry.db
+Restart=always
+RestartSec=5
+KillMode=process
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

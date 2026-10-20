@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: os-rl-agent
+    runtime: docker
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: OSRL_DB
+        value: /data/telemetry.db
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: osrl-data
+      mountPath: /data
+      sizeGB: 5
+    healthCheckPath: /
+    region: singapore  # closest to India
