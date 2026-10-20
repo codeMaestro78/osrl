@@ -5,7 +5,7 @@ guarded (reversible) interventions, RL as a candidate policy that must earn
 its autonomy. See `DESIGN.md` for the architecture and `DESIGN.md` §11 for
 the research-audit amendments.
 
-## Status (Phase 1 complete — risk estimator + PSI triggers, observe-only)
+## Status (Phase 3 complete — digital twin + baselines, observe-only)
 
 Implemented and tested:
 
@@ -118,6 +118,41 @@ Not implemented yet (by plan): digital twin + baselines (Phase 3), Gym env
   `OSRL_HEAVY_*` env overrides; risk thresholds behind `OSRL_RISK_*`,
   guard behind `OSRL_GUARD_*` (tuning now needs no code edits).
 
+### Phase 3 — digital twin + baselines (implemented, observe-only)
+
+The twin is the **measurement layer** any RL policy must be able to beat;
+it is NOT a world-simulator and invents nothing. Everything scores
+(predictions from data ≤ t) against RECORDED rows at t+h.
+
+- **Session slicing** (`osrl/twin.py`): telemetry is cut into sessions
+  wherever a sample gap exceeds `max(3× median interval, 10 s)` — no
+  prediction is ever asked to bridge a daemon outage; every baseline
+  restarts fresh per session. Missing metrics stay missing (None), and
+  every score publishes its own coverage (`n_pairs`, `n_abstained`).
+- **Baseline registry**: `noop` (always abstains — the floor),
+  `hold` (persistence: last observed value), `linear` (OLS trailing-window
+  trend with per-feature abstention until ≥3 points spanning the window).
+- **Causal evaluation harness**: targets matched nearest-first within 1%
+  of the sampling interval, never interpolated, never across sessions;
+  horizons 30/60/120 s; mae/bias computed only over (predicted, recorded)
+  pairs both sides real values.
+- **Renice forward model** (spec `SPEC_RENICE_TWIN`): action-conditioned
+  difference-in-differences over applied ledger rows vs matched pre/post
+  windows; **needs 8 real pairs, has 0, so it abstains on every
+  prediction** (`insufficient-real-evidence(0<8)`) — the same honest
+  refusal as the staleness gate, no fabricated effect sizes.
+- **Report CLI**: `osrl-twin --db PATH [--horizons 30,60,120]` prints a
+  JSON report; both console scripts (`osrl-collector`, `osrl-twin`) are
+  now exercised after a fresh `pip install -e .`.
+
+**Measured on the real hold-test bank** (1.78 h continuous, 223 samples,
+single session; timestamp jitter ±0.0003 s): hold beats linear at
+essentially every horizon/feature (details in DESIGN.md §14.4) — e.g.
+cpu MAE 1.66% vs 1.82% at 30 s, 2.14% vs 2.50% at 60 s, 2.59% vs 3.45%
+at 120 s; psi stall-ratio MAE ~2e-4 (hold). On a mean-reverting,
+mostly-idle desktop, persistence is the number to beat, so the Phase 4
+acceptance bar is *beat-hold on this harness*, not beat-noop.
+
 ## Quickstart (this repo)
 
 ```bash
@@ -125,7 +160,7 @@ python3 -m venv .venv
 ./.venv/bin/pip install -q psutil nvidia-ml-py pytest ruff  # dev install
 ./.venv/bin/pip install -e .                                 # optional: CLI entry
 
-./.venv/bin/python -m pytest -q          # full test suite (140 tests)
+./.venv/bin/python -m pytest -q          # full test suite (155 tests)
 ./.venv/bin/python -m osrl.daemon --db data/telemetry.db --once   # smoke
 ./.venv/bin/python -m osrl.daemon --db data/telemetry.db         # run forever
 
@@ -133,6 +168,9 @@ python3 -m venv .venv
 # per-invocation human approval gate (the daemon NEVER runs this)
 ./.venv/bin/python -m osrl.worker --db data/telemetry.db          # dry peek
 ./.venv/bin/python -m osrl.worker --db data/telemetry.db --execute
+
+# Digital twin: evaluate baseline forecasters over recorded telemetry
+./.venv/bin/osrl-twin --db data/telemetry.db --horizons 30,60,120
 ```
 
 Configuration via environment (see `osrl/config.py`): `OSRL_DB`,

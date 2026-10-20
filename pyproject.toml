@@ -17,6 +17,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 osrl-collector = "osrl.daemon:main"
+osrl-twin = "osrl.twin:main"
 
 [tool.setuptools]
 packages = ["osrl"]

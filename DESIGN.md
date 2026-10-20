@@ -411,3 +411,92 @@ identity refusal), ledger+invariants (10: strict columns, CAS chains,
 lease release, prune, legacy migration, RL-free scan). Live smoke: dry
 peek honest, execute applied 0→10 verified, spam rejected, restore
 rejected, ledger 1:1 with intents (3→0 pending), worker CLI rc=0.
+
+## 14. Phase 3 implementation record (digital twin + baselines, 2026-10-20)
+
+### 14.1 What the twin is — and is not
+
+The twin is the MEASUREMENT layer RL must beat, not a script that dreams
+up a world. It loads recorded samples, slices them into sessions, and
+scores simple causal forecasters at 30/60/120 s horizons. No synthesis of
+future states; every scored pair is (prediction made from data ≤ t) vs
+(a RECORDED row at t+h).
+
+### 14.2 Session slicing (`osrl/twin.py`)
+
+Sessions = contiguous runs split where a sample gap exceeds
+max(3× median observed interval, 10 s). The hold-test bank currently
+yields ONE session (223 samples / 1.78 h, zero gaps) — which makes
+"held-out folds" degenerate for now; the harness still isolates state
+per session (fresh clone), so multi-session data later is automatically
+clean. Timestamp jitter on the real bank measured ±0.0003 s (p99), well
+inside the 1%-of-interval match tolerance.
+
+### 14.3 Baseline registry
+
+- `noop`: abstains always. The floor: 0 pairs, full abstention column.
+- `hold` (persistence): next value = last observed. THE bar to beat.
+- `linear` (OLS trailing-window trend): extrapolation with per-feature
+  abstention until ≥3 points spanning ≥60 s in-window.
+Features (all None-preserving): psi_mem_stall_ratio (diff/interval),
+swp_out_ps, allocstall_ps, mem_available_mib, swap_used_pct,
+cpu_total_pct.
+
+### 14.4 Measured on the real bank (measured numbers)
+
+n≈220 pairs/horizon; lookahead targets matched nearest-first within
+1% of interval, never interpolated, never across sessions.
+
+| feature           | h=30 MAE (hold vs linear) | h=60 | h=120 |
+|-------------------|---------------------------|------|-------|
+| cpu_total_pct     | 1.66 vs 1.82              | 2.14 vs 2.50 | 2.59 vs 3.45 |
+| psi_mem_ratio     | 1.87e-4 vs 1.96e-4        | 2.28e-4 vs 2.73e-4 | 2.23e-4 vs 3.56e-4 |
+| swp_out_ps        | 62.2 vs 66.7              | 71.3 vs 97.9 | 72.0 vs 149.4 |
+| mem_available_mib | 140 vs 165                | 182 vs 247 | 278 vs 415 |
+| swap_used_pct     | 0.21 vs 0.35              | 0.40 vs 0.69 | 0.67 vs 1.33 |
+| allocstall_ps     | 0.197 vs 0.148            | 0.164 vs 0.207 | 0.165 vs 0.303 |
+
+Read: persistence dominates trend extrapolation on a mean-reverting,
+mostly-idle desktop (linear loses more at longer horizons everywhere
+except allocstall at 30 s). Therefore the honest acceptance bar for any
+Phase 4 policy is BEAT-HOLD on this harness, not beat-noop.
+
+### 14.5 Renice forward model — abstains by design
+
+The action-conditioned estimator (`ReniceForwardModel`; spec in
+`SPEC_RENICE_TWIN` inside twin.py) runs difference-in-differences over
+applied-ledger rows against matched pre/post windows. Real applied
+renice rows on this deployment: 0 (the Phase 2 live smoke used
+`--execute` once, but that DB was a smoke fixture, not the hold-test
+bank). So the model reports `insufficient-real-evidence(0<8)` for every
+requested prediction. This is the SAME rejection rule as stale
+telemetry: no numbers can be manufactured. It activates only when 8+
+real (target, before, after, ledger row) quadruples exist with
+interpolable sample windows.
+
+### 14.6 Report surface
+
+`osrl-twin --db PATH [--horizons 30,60,120]` (console script wired in
+pyproject; exercised live on the hold-test bank) prints a JSON report —
+per baseline × horizon × feature — with n_pairs / mae / bias /
+n_abstained, so "good MAE over 2 pairs" can never pass as evidence.
+
+### 14.7 Console entries now both exercised
+
+`osrl-collector --help` (risk item #3 earlier flagged it unexercised)
+and `osrl-twin` (fresh `pip install -e .` re-install verified both
+launch). Remaining known limits: single-session evaluation is
+within-sample until more hold-out data accumulates; risk-level
+escalation (Phase 1) still only bench-verified; no real ledger
+evidence for the forward model yet (see 14.5).
+
+### 14.8 Tests: 155 passing (140 before)
+
+New suite tests/test_twin.py (15): slicing (outage split, cadence
+respect, None preservation), baselines (noop floor, hold persistence +
+per-key abstention, trend extrapolation exact-OLS + span/points rules),
+harness (in-session-only target matching with exact pair counts, mae /
+bias / coverage honesty, causality via spike-persistence mae
+arithmetic, session isolation), renice model (abstention on real
+schema, spec honesty), and the real-bank smoke (hold forms pairs at all
+horizons; noop floor exact). Full suite 155; ruff clean.
