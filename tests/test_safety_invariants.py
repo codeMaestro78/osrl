@@ -13,6 +13,8 @@ FORBIDDEN_MODULE_ROOTS = (
 GUARD_CHAIN_MODULES = (
     "guard.py", "worker.py", "executor.py", "pidfd.py", "procid.py",
 )
+# RL package modules that must NEVER appear in the guard chain
+RL_MODULE_ROOTS = ("osrl.rl", "osrl.dashboard")
 
 
 def imported_roots(module_path: Path) -> set[str]:
@@ -67,3 +69,46 @@ def test_adapters_never_write_nice():
     # READ cpu times (nice field name) and never call Process.nice(arg)
     assert "nice(" not in src.replace("nice=0.0", "")
     assert "renice" not in src
+
+
+def test_rl_modules_not_in_guard_chain():
+    """The RL package (osrl.rl.*) must never be imported by the guard chain.
+    This ensures RL inference failures / import errors can never block safety."""
+    for name in GUARD_CHAIN_MODULES:
+        path = REPO / "osrl" / name
+        tree = ast.parse(path.read_text())
+        bad_imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    for root in RL_MODULE_ROOTS:
+                        if alias.name.startswith(root):
+                            bad_imports.append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                for root in RL_MODULE_ROOTS:
+                    if mod.startswith(root):
+                        bad_imports.append(mod)
+        assert not bad_imports, (
+            f"{name} imports RL/dashboard modules: {bad_imports}"
+        )
+
+
+def test_train_never_imported_by_daemon():
+    """The RL training module must never be imported by the collector daemon.
+    Training is a separate process that must not start during telemetry collection."""
+    tree = ast.parse((REPO / "osrl" / "daemon.py").read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    rl_imports = [
+        m for m in imported
+        if m.startswith("osrl.rl") or m.startswith("osrl.dashboard")
+        or m in ("sb3_contrib", "stable_baselines3", "gymnasium", "torch")
+    ]
+    assert not rl_imports, (
+        f"daemon.py imports RL/training module: {rl_imports}"
+    )
