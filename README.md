@@ -6,7 +6,7 @@ classifies freeze risk, and permits only guarded, reversible interventions.
 Reinforcement learning is a candidate policy that must beat a measured
 baseline and pass an evaluation gate — it is never on the safety path.
 
-`Python 3.10+` · `Linux with PSI` · `222 tests` · `unprivileged by default`
+`Python 3.10+` · `Linux with PSI` · `253 tests` · `unprivileged by default`
 
 [Architecture](DESIGN.md) · [Quickstart](#quickstart) · [Dashboard](#dashboard) ·
 [Deployment](#deployment) · [Safety model](#safety-model)
@@ -35,7 +35,7 @@ kernel cannot provide them; nothing is fabricated as zero.
 | **Actions** | `renice_back` only, behind `worker → guard → pidfd → executor → ledger` | ✅ gated; `--execute` required |
 | **Twin** | Session slicing, `noop`/`hold`/`linear`/`ewma`/`rolling-median` baselines, 30/60/120 s evaluation, renice forward model | ✅ abstains below 8 real pairs |
 | **RL** | Gymnasium env, action masking, multi-term reward, MaskablePPO training, inference/intent bridge | ✅ training; **no validated policy** |
-| **Dashboard** | Six-page Streamlit control plane | ✅ local + Cloud demo |
+| **Dashboard** | Seven-page Streamlit control plane | ✅ local + Cloud demo |
 | **Deployment** | systemd units, Docker/supervisord, Fly/Render/Railway configs, Streamlit Cloud demo | ✅ |
 
 **Deliberately not enabled**
@@ -125,7 +125,7 @@ For development and tests:
 
 ```bash
 ./.venv/bin/pip install -e ".[dev,dashboard]"
-./.venv/bin/python -m pytest -q        # 222 tests
+./.venv/bin/python -m pytest -q        # 252 passed, 1 optional fixture skipped
 ```
 
 For RL training (installs PyTorch, Gymnasium, SB3):
@@ -145,7 +145,8 @@ same SQLite store the collector writes.
 | **Processes** | Top CPU/RSS, top-10 memory consumers, per-core distribution, process events, action ledger |
 | **Data Explorer** | Auto-train status, dataset coverage, feature distributions, correlations, raw sample browser |
 | **Agent** | Mode gate (observe/advise/autopilot), checkpoint status, reward history, action ledger |
-| **Training** | Reward curves, reward-term breakdown, checkpoint manager, training launcher, live log |
+| **Evaluation** | Data quality, chronological split readiness, risk-policy and forecast comparisons, downloadable evidence |
+| **Training** | Per-run reward curves, reward breakdown, checkpoint reports, training launcher, durable log |
 | **History** | 15-minute rollups, 7-day trends, hour-of-day CPU heatmap, full event log |
 
 The Cloud demo disables the training launcher and labels itself as a recorded
@@ -211,10 +212,22 @@ abstains rather than inventing an effect size.
   swap free, foreground share, OOM risk, stability, trend, action cost.
 - Training is CPU-only and re-nices itself `+10` so it does not compete with
   the desktop.
-- Checkpoints are named `ckpt_stepNNNNNNNN_VALIDATED` or
-  `..._UNVALIDATED`; `best` is a symlink to the best evaluated checkpoint.
-- Promotion gate: mean eval reward must beat the NOOP baseline by 5%
-  (`EVAL_GATE_REWARD_RATIO = 0.05`).
+- Each run gets its own directory. Every checkpoint has a matching
+  `.vecnorm.pkl` and `.json` evaluation report. `latest` points to the newest
+  checkpoint; `candidate` points to the best replay score in the latest run.
+- Training uses the oldest 80% of a frozen dataset; evaluation uses later
+  contiguous data after a ten-sample embargo. Both policies see identical
+  held-out episodes and rewards are reported without reward normalization.
+- The sign-correct reward diagnostic requires improvement by 5% of the
+  absolute NOOP reward. **Replay cannot promote a policy:** actions do not
+  change recorded future telemetry. All replay checkpoints remain
+  `UNVALIDATED`; `best` is reserved for separately validated policies.
+- Evaluation reports fingerprint the held-out rows. `--eval-only` loads the
+  checkpoint, its exact normalization statistics and original held-out range,
+  and refuses evaluation if that data has changed or expired.
+- Older checkpoints lacking matching normalization and provenance are kept,
+  but cannot be resumed automatically. Start a fresh run to create a complete
+  artifact set.
 
 **Current state:** training runs produce checkpoints locally, but none has
 passed the gate (all `UNVALIDATED`); no checkpoint is shipped with the
@@ -230,7 +243,11 @@ worker, guard, and executor.
 ```
 
 Defaults: poll every 60 s, require 500 new samples and at least 1 hour between
-runs, 50k steps per run, resume from `best`.
+runs, 50k steps per run, resume from a compatible `best` or `latest` checkpoint. Training and scheduler
+instances use separate per-database locks. Failed launches retain a durable
+cooldown; samples arriving during training count toward the next run using the
+snapshot watermark. Training waits when collector telemetry is stale. Child
+output is retained in `<checkpoint-dir>/training.log`.
 
 ## Configuration
 
@@ -435,7 +452,7 @@ osrl/
   rl/               # env, obs, mask, reward, train, inference, auto_train
   dashboard/        # Streamlit app, pages, shared helpers, bootstrap
 deploy/             # systemd units, Docker/supervisord, tunnel, demo builder
-tests/              # 222 tests: collector, store, guard, twin, RL, safety
+tests/              # 252 passed, 1 optional fixture skipped: collector, store, guard, twin, RL, safety
 ```
 
 ## Known limitations
@@ -461,6 +478,8 @@ guarded) action set.
 - §13 — Phase 2: guard, pidfd, the restore-capability finding, schema v2
 - §14 — Phase 3: twin measurements and forward-model abstention
 - §15 — Phase 4: policy evaluation, evidence pipeline, live validation
+
+[IMPROVEMENTS.md](IMPROVEMENTS.md) records the correctness pass, validation, and remaining limits.
 
 The Git history is also organized by phase. The later RL stack, dashboard,
 and deployment work is documented in this README and the commit history.

@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 
 logging.basicConfig(
@@ -47,12 +49,14 @@ DEFAULT_STEPS            = 50_000
 DEFAULT_CHECKPOINT_DIR   = Path("~/os-rl-agent/checkpoints").expanduser()
 
 _STOP = False
+_WAKE = threading.Event()
 
 
 def _handle_signal(sig, _frame):
     global _STOP
     log.info("Received signal %s — stopping after current poll.", sig)
     _STOP = True
+    _WAKE.set()
 
 
 def _write_event(conn, kind: str, payload: dict) -> None:
@@ -95,15 +99,13 @@ def _samples_since(conn, since_ts: float) -> int:
         return 0
 
 
-def _is_training_running() -> bool:
-    """Check if an osrl-train / rl.train process is already running."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "osrl.rl.train|osrl-train"],
-            capture_output=True, text=True,
-        )
-        return result.returncode == 0
-    except Exception:  # noqa: BLE001
+def _is_training_running(db_path: str) -> bool:
+    """Probe the same per-database lock held by all training launchers."""
+    with open(f"{Path(db_path).expanduser().resolve()}.training.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
         return False
 
 
@@ -116,6 +118,8 @@ def _launch_training(
 ) -> subprocess.Popen:
     """Launch training as a detached subprocess."""
     best_link = checkpoint_dir / "best"
+    if not best_link.exists():
+        best_link = checkpoint_dir / "latest"
     cmd = [
         sys.executable, "-m", "osrl.rl.train",
         "--db", db_path,
@@ -124,21 +128,57 @@ def _launch_training(
     ]
     if synthetic:
         cmd.append("--synthetic")
-    if resume and best_link.exists():
+    from osrl.rl.artifacts import normalization_path
+    if resume and best_link.exists() and normalization_path(best_link).exists():
         cmd.extend(["--resume", str(best_link)])
 
     log.info("Launching training: %s", " ".join(cmd))
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
-    return proc
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # A PIPE with no reader fills and blocks PPO indefinitely. Keep durable,
+    # inspectable output without a parent pipe or an unbounded memory buffer.
+    with (checkpoint_dir / "training.log").open("a") as output:
+        return subprocess.Popen(
+            cmd, stdout=output, stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,
+        )
 
 
-def run_scheduler(
+def _scheduler_state(conn) -> dict:
+    row = conn.execute("SELECT value FROM meta WHERE key='auto_train_state'").fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def _save_state(conn, state: dict) -> None:
+    conn.execute("INSERT INTO meta(key,value) VALUES ('auto_train_state',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(state),))
+    conn.commit()
+
+
+def _last_data_ts(conn) -> float:
+    row = conn.execute("SELECT payload FROM events WHERE kind='rl_train_done' "
+                       "ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return 0.0
+    return float(json.loads(row[0]).get("training_data_end_ts", 0.0))
+
+
+def run_scheduler(*args, **kwargs) -> None:
+    """One scheduler per database; training itself has a separate atomic lock."""
+    db = kwargs.get("db_path", args[0] if args else None)
+    path = Path(db).expanduser().resolve()
+    if not path.exists():
+        raise ValueError("Telemetry database does not exist; start the collector first")
+    with open(f"{path}.scheduler.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("An auto-training scheduler already owns this database") from exc
+        _run_scheduler(*args, **kwargs)
+
+
+
+def _run_scheduler(
     db_path: str,
     steps: int = DEFAULT_STEPS,
     synthetic: bool = True,
@@ -152,6 +192,10 @@ def run_scheduler(
     import sqlite3
 
     global _STOP
+    _STOP = False
+    _WAKE.clear()
+    if min(steps, min_samples, min_interval_s, poll_s) <= 0:
+        raise ValueError("Scheduler steps, samples, interval and poll must be positive")
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
 
@@ -173,6 +217,7 @@ def run_scheduler(
     while not _STOP:
         try:
             conn = sqlite3.connect(db_path_expanded, timeout=10)
+            state = _scheduler_state(conn)
             conn.row_factory = sqlite3.Row
 
             # ── Check if active training subprocess is still alive ─────────
@@ -184,22 +229,30 @@ def run_scheduler(
                         "pid": active_proc.pid,
                         "next_check_in": int(poll_s),
                     })
-                    conn.close()
-                    time.sleep(poll_s)
-                    continue
                 else:
                     log.info("Training subprocess finished (exit=%d).", ret)
+                    _write_event(conn, "auto_train_finished" if ret == 0 else "auto_train_failed", {
+                        "pid": active_proc.pid, "exit_code": ret,
+                        "log_path": str(checkpoint_dir / "training.log"),
+                    })
+                    state["last_exit_code"] = ret
+                    state["finished_ts"] = time.time()
+                    _save_state(conn, state)
                     active_proc = None
 
             # ── Eligibility checks ────────────────────────────────────────
             now            = time.time()
             last_train     = _last_train_ts(conn)
             time_since     = now - last_train
-            n_new_samples  = _samples_since(conn, last_train)
+            n_new_samples  = _samples_since(conn, _last_data_ts(conn))
             total_samples  = _sample_count(conn)
-            already_running= _is_training_running()
+            already_running= active_proc is not None or _is_training_running(db_path_expanded)
 
-            next_run_in    = max(0.0, min_interval_s - time_since)
+            # Persist failure backoff across scheduler/service restarts.
+            retry_after = float(state.get("last_attempt_ts", 0)) + min_interval_s
+            next_run_in = max(0.0, min_interval_s - time_since, retry_after - now)
+            latest = conn.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
+            telemetry_fresh = latest is not None and 0 <= now - latest <= max(60, poll_s * 2)
             needed_samples = max(0, min_samples - n_new_samples)
 
             log.info(
@@ -218,11 +271,15 @@ def run_scheduler(
                 "next_run_in_s":   int(next_run_in),
                 "already_running": already_running,
                 "scheduler_ts":    now,
+                "min_interval_s": min_interval_s,
+                "telemetry_fresh": telemetry_fresh,
+                "last_exit_code": state.get("last_exit_code"),
+                "log_path": str(checkpoint_dir / "training.log"),
             })
 
             if already_running:
                 log.info("Training already running (external). Skipping trigger.")
-            elif n_new_samples >= min_samples and time_since >= min_interval_s:
+            elif n_new_samples >= min_samples and next_run_in <= 0 and telemetry_fresh:
                 log.info(
                     "✅ Conditions met — triggering training! "
                     "new_samples=%d  time_since=%.0fs",
@@ -234,11 +291,13 @@ def run_scheduler(
                     "steps": steps,
                     "synthetic": synthetic,
                 })
+                state["last_attempt_ts"] = now
+                _save_state(conn, state)
                 conn.close()
                 active_proc = _launch_training(
                     db_path_expanded, steps, synthetic, checkpoint_dir, resume
                 )
-                time.sleep(poll_s)
+                _WAKE.wait(poll_s)
                 continue
             else:
                 reasons = []
@@ -252,9 +311,19 @@ def run_scheduler(
 
         except Exception as exc:  # noqa: BLE001
             log.warning("Scheduler poll error: %s", exc)
+        finally:
+            if "conn" in locals():
+                conn.close()
 
-        time.sleep(poll_s)
+        _WAKE.wait(poll_s)
 
+    if active_proc is not None and active_proc.poll() is None:
+        active_proc.terminate()
+        try:
+            active_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            active_proc.kill()
+            active_proc.wait(timeout=5)
     log.info("Auto-trainer stopped.")
 
 

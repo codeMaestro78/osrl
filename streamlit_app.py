@@ -26,4 +26,6 @@ from osrl.dashboard.bootstrap import bootstrap_database  # noqa: E402
 os.environ["OSRL_DB"] = bootstrap_database(ROOT)
 
 # Importing the module executes the dashboard script (Streamlit rerun model).
-from osrl.dashboard import app  # noqa: E402,F401
+import runpy
+
+runpy.run_module("osrl.dashboard.app", run_name="__main__")

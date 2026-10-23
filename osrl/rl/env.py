@@ -23,9 +23,9 @@ Safety: RENICE_BACK in the env does NOT call executor.py. It writes an
 
 from __future__ import annotations
 
+import math
 import random
 import sqlite3
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,7 +40,8 @@ except ImportError as e:
         "Install with: pip install 'osrl-agent[rl]'"
     ) from e
 
-from osrl.collector import PsiInterval, Sample
+from osrl.collector import GpuSample, PsiInterval, Sample
+from osrl.risk import RiskTracker
 from osrl.rl.mask import compute_action_mask
 from osrl.rl.obs import (
     N_ACTIONS,
@@ -49,7 +50,7 @@ from osrl.rl.obs import (
     AgentState,
     encode_obs,
 )
-from osrl.rl.reward import compute_reward
+from osrl.rl.reward import compute_reward, reward_breakdown
 from osrl.twin import sessions_from_rows
 
 # ---------------------------------------------------------------------------
@@ -67,13 +68,19 @@ class StressScenario:
 
 def _inject_stress(sample: Sample, scenario: StressScenario) -> Sample:
     """Overlay stress onto a sample. Returns a new Sample; original unmodified."""
-    interval = sample.interval_s or 2.0
-    stall_us = int(scenario.psi_mem_stall_ratio * interval * 1e6)
+    interval = sample.interval_s
+    if interval is None or not math.isfinite(interval) or interval <= 0:
+        return sample
+    existing = sample.psi_mem or PsiInterval()
+    stall_us = min(int(interval * 1e6), max(
+        existing.some_stall_us or 0, existing.full_stall_us or 0,
+        int(scenario.psi_mem_stall_ratio * interval * 1e6),
+    ))
     new_psi_mem = PsiInterval(
         some_stall_us=stall_us,
-        some_total_us=sample.psi_mem.some_total_us,
-        full_stall_us=sample.psi_mem.full_stall_us,
-        full_total_us=sample.psi_mem.full_total_us,
+        some_total_us=existing.some_total_us,
+        full_stall_us=existing.full_stall_us,
+        full_total_us=existing.full_total_us,
     )
     # Overlay swap-out spike
     swp = max(sample.swp_out_ps or 0.0, scenario.swp_out_spike_ps)
@@ -176,6 +183,14 @@ def _row_to_sample(row: sqlite3.Row) -> Sample:
             full_stall_us=_i("psi_io_full_stall_us"),
             full_total_us=_i("psi_io_full_total_us"),
         ),
+        gpu=GpuSample(
+            util_pct=_f("gpu_util_pct"), mem_used_mib=_f("gpu_mem_used_mib"),
+            mem_total_mib=_f("gpu_mem_total_mib"), temp_c=_f("gpu_temp_c"),
+            power_w=_f("gpu_power_w"),
+        ) if any(_f(k) is not None for k in (
+            "gpu_util_pct", "gpu_mem_used_mib", "gpu_mem_total_mib", "gpu_temp_c", "gpu_power_w"
+        )) else None,
+        gpu_top_procs=_json("gpu_top_procs_json"),
         top_procs=_json("top_procs_json"),
     )
 
@@ -209,6 +224,8 @@ class OSResourceEnv(gym.Env):
         stress_scenario: StressScenario | None = None,
         cooldown_steps: int = 15,
         seed: int | None = None,
+        sessions: list[list[Sample]] | None = None,
+        allow_synthetic_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.db_path = db_path
@@ -229,7 +246,14 @@ class OSResourceEnv(gym.Env):
         self._stress_countdown: int = 0
         self._rng = random.Random(seed)
         self._np_rng = np.random.default_rng(seed)
-        self._load_sessions()
+        self._risk_tracker = RiskTracker()
+        self._allow_synthetic_fallback = allow_synthetic_fallback
+        if sessions is None:
+            self._load_sessions()
+        else:
+            self._sessions = [list(s) for s in sessions if len(s) >= N_OBS_STEPS * 2]
+            if not self._sessions:
+                raise ValueError("No usable real replay sessions")
 
     # ------------------------------------------------------------------ setup
 
@@ -255,6 +279,8 @@ class OSResourceEnv(gym.Env):
         if not self._sessions:
             # Fallback: create a minimal synthetic session so the env is usable
             # even with an empty or tiny DB (e.g. in CI)
+            if not self._allow_synthetic_fallback:
+                raise ValueError("No usable real replay sessions; synthetic fallback disabled")
             self._sessions = [self._make_synthetic_session()]
 
     def _make_synthetic_session(self, n_samples: int = 200) -> list[Sample]:
@@ -291,10 +317,12 @@ class OSResourceEnv(gym.Env):
             self._rng = random.Random(seed)
 
         # Pick a random session for this episode
-        self._cur_session = deepcopy(self._rng.choice(self._sessions))
-        self._step_idx = 0
+        self._cur_session = list(self._rng.choice(self._sessions))
+        self._step_idx = N_OBS_STEPS
         self._agent = AgentState()
-        self._window = []
+        self._window = self._cur_session[:N_OBS_STEPS]
+        self._risk_tracker = RiskTracker()
+        self._update_risk(self._window)
         self._stress_countdown = 0
 
         obs = self._build_obs()
@@ -302,6 +330,12 @@ class OSResourceEnv(gym.Env):
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
         """Advance one 20 s decision window."""
+        if not self.action_space.contains(action):
+            raise ValueError(f"Invalid action: {action}")
+        if self._step_idx >= len(self._cur_session):
+            raise RuntimeError("Episode finished; call reset() before step()")
+        if not self.action_masks()[action]:
+            raise ValueError(f"Action {action} is masked for this state")
         # Collect the next N_OBS_STEPS samples
         start = self._step_idx
         end = min(start + N_OBS_STEPS, len(self._cur_session))
@@ -315,11 +349,12 @@ class OSResourceEnv(gym.Env):
                 raw_window = [_inject_stress(s, self.stress_scenario)
                               for s in raw_window]
             elif self._rng.random() < self.stress_scenario.probability:
-                self._stress_countdown = self.stress_scenario.duration_steps
+                self._stress_countdown = max(0, self.stress_scenario.duration_steps - 1)
                 raw_window = [_inject_stress(s, self.stress_scenario)
                               for s in raw_window]
 
         self._window = raw_window
+        self._update_risk(raw_window)
 
         # Update agent state
         n_actions = 0 if action == 0 else 1  # NOOP=0 has no cost
@@ -340,10 +375,19 @@ class OSResourceEnv(gym.Env):
         obs = self._build_obs()
         info: dict[str, Any] = {
             "action": action,
-            "reward_components": {},
+            "reward_components": reward_breakdown(raw_window, n_actions),
+            "transition_model": "recorded_replay_no_action_effect",
             "step_idx": self._step_idx,
         }
         return obs, reward, done, False, info
+
+    def _update_risk(self, window: list[Sample]) -> None:
+        for sample in window:
+            verdict = self._risk_tracker.feed(sample, now=sample.ts)
+            self._agent.risk_level = verdict.level
+            self._agent.bad_streak = verdict.bad_streak
+            self._agent.good_streak = verdict.good_streak
+            self._agent.psi_recent = verdict.psi_recent
 
     def action_masks(self) -> np.ndarray:
         """Return action mask array (sb3-contrib MaskablePPO contract)."""

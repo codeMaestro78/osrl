@@ -165,8 +165,10 @@ class Collector:
         providers: Providers,
         heavy_cpu_pct: float = 25.0,
         heavy_rss_mib: float = 200.0,
+        top_k_procs: int = 15,
     ) -> None:
         self._p = providers
+        self._top_k = max(1, int(top_k_procs))
         self._heavy_cpu = heavy_cpu_pct
         self._heavy_rss = heavy_rss_mib * 1024 * 1024
         self._last_ts: float | None = None
@@ -211,7 +213,7 @@ class Collector:
             if prev is not None and dt:
                 pb, pt = prev.busy_ratio()
                 cb, ct = cur.busy_ratio()
-                if ct > pt:
+                if ct > pt and 0 <= cb - pb <= ct - pt:
                     s.cpu_total_pct = (cb - pb) / (ct - pt) * 100.0
             self._last_cpu = cur
 
@@ -222,7 +224,8 @@ class Collector:
                 for pcpu, ccpu in zip(prev_list, cur_list, strict=False):
                     pb, pt = pcpu.busy_ratio()
                     cb, ct = ccpu.busy_ratio()
-                    per.append((cb - pb) / (ct - pt) * 100.0 if ct > pt else None)
+                    per.append((cb - pb) / (ct - pt) * 100.0
+                               if ct > pt and 0 <= cb - pb <= ct - pt else None)
                 s.cpu_percpu_pct = per
             self._last_percpu = cur_list
 
@@ -230,6 +233,9 @@ class Collector:
             s.load1, s.load5, s.load15 = l1, l5, l15
         except OSError:
             s.cpu_total_pct = None
+            s.cpu_percpu_pct = []
+            self._last_cpu = None
+            self._last_percpu = None
 
     def _collect_mem(self, s: Sample) -> None:
         m = self._p.virtual_memory()
@@ -325,7 +331,7 @@ class Collector:
 
         # 2) heaviness classification: births for new heavy identities and
         #    for tracked processes that just crossed a heavy threshold
-        enriched: list[tuple[float, ProcRow]] = []
+        enriched: list[tuple[tuple, ProcRow]] = []
         for row in rows:
             prior = prev.get(row.key)
             cpu_pct = self._proc_cpu_pct(row, prior, dt)
@@ -334,7 +340,8 @@ class Collector:
             heavy = rss_heavy or cpu_heavy
 
             # First tick has no CPU history -> rank by RSS instead of inventing %
-            weight = cpu_pct if cpu_pct is not None else row.rss_bytes / (1024 * 1024)
+            weight = ((cpu_pct is not None, cpu_pct or 0.0, row.rss_bytes)
+                      if dt else (False, 0.0, row.rss_bytes))
             enriched.append((weight, row))
 
             if not heavy:
@@ -360,7 +367,7 @@ class Collector:
         # 3) top-K ranking (CPU after history exists, RSS on the first tick)
         enriched.sort(key=lambda item: item[0], reverse=True)
         top: list[dict] = []
-        for _, row in enriched[:_TOP_K]:
+        for _, row in enriched[:self._top_k]:
             top.append(
                 {"pid": row.pid, "start_time": row.start_time,
                  "name": row.name,

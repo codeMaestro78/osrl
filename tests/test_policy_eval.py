@@ -150,3 +150,30 @@ def test_labels_reuse_risk_config_not_duplicated_thresholds():
     loose = LabelConfig(psi_crit_ratio=0.3)
     assert event_segments(rows, strict) == []
     assert len(event_segments(rows, loose)) == 1
+
+
+def test_prealarm_runs_cannot_make_precision_negative():
+    from osrl.policy_eval import AlarmDecision, AlarmPolicy, ALARM, PREALARM, QUIET
+    class Scripted(AlarmPolicy):
+        name = "scripted"
+        def reset(self):
+            self.index = 0
+        def observe(self, sample, ts):
+            decisions = [PREALARM, QUIET, PREALARM, QUIET, ALARM, QUIET]
+            value = decisions[self.index]
+            self.index += 1
+            return AlarmDecision(value)
+    rows = make_rows([(i * 2, 2, 0, 0) for i in range(6)])
+    result = evaluate_alarm_policies(rows, [Scripted()])["scripted"]
+    assert result["precision"] == 0
+    assert result["n_false_alarm_runs"] == 1
+    assert result["n_prealarm_only_runs"] == 2
+
+
+def test_policy_streaks_reset_across_outages():
+    # Five bad ticks before and after an outage cannot form a ten-tick critical streak.
+    rows = make_rows([(i * 2, 2, 1600000, 0) for i in range(5)] +
+                     [(1000 + i * 2, 2, 1600000, 0) for i in range(5)])
+    result = evaluate_alarm_policies(rows, [RiskPolicy()])["risk_tracker"]
+    assert result["n_alarm_runs"] == 0
+    assert result["n_prealarm_only_runs"] == 2

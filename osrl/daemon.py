@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from osrl.adapters import default_providers
@@ -97,6 +98,7 @@ def _run_locked(
         providers,
         heavy_cpu_pct=cfg.collector.heavy_cpu_pct,
         heavy_rss_mib=cfg.collector.heavy_rss_mib,
+        top_k_procs=cfg.collector.top_k_procs,
     )
     risk_tracker = RiskTracker(cfg.risk)
     ncpu = os.cpu_count() or 1
@@ -199,6 +201,10 @@ def _run_locked(
                 store.prune(ts, cfg.retention.raw_days, cfg.retention.events_days)
                 last_ret = ts
 
+            if batch and ts >= rollup_until + ret.rollup_seconds:
+                store.insert_samples(batch)
+                batch.clear()
+                last_flush = ts
             rollup_until = _rollup_complete_windows(store, ts, rollup_until,
                                                     ret.rollup_seconds)
 
@@ -357,17 +363,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_config()
-    if args.db:
-        cfg = Config(
-            db_path=Path(args.db).expanduser(),
-            collector=cfg.collector.__class__(
-                interval_s=args.interval or cfg.collector.interval_s,
-                heavy_cpu_pct=cfg.collector.heavy_cpu_pct,
-                heavy_rss_mib=cfg.collector.heavy_rss_mib,
-                top_k_procs=cfg.collector.top_k_procs,
-            ),
-            retention=cfg.retention,
-        )
+    if args.interval is not None and (not math.isfinite(args.interval) or args.interval <= 0):
+        parser.error("--interval must be a finite positive number")
+    cfg = replace(
+        cfg,
+        db_path=Path(args.db).expanduser() if args.db else cfg.db_path,
+        collector=replace(cfg.collector, interval_s=(
+            args.interval if args.interval is not None else cfg.collector.interval_s
+        )),
+    )
     try:
         run(cfg, once=args.once)
     except KeyboardInterrupt:

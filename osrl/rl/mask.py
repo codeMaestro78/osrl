@@ -56,7 +56,7 @@ def compute_action_mask(
 
     # RENICE_BACK: conditional
     renice_ok = True
-    if agent.risk_level in ("none", "unknown"):
+    if agent.risk_level not in ("elevated", "critical"):
         renice_ok = False   # no pressure → no need; unknown → abstain
     if agent.steps_since_last_action < cooldown_steps:
         renice_ok = False   # within cooldown window

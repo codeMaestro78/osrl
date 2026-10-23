@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from osrl.collector import PsiInterval, Sample
 from osrl.config import RiskConfig
 from osrl.risk import RiskTracker
+from osrl.twin import median_interval
 
 ALARM = "alarm"
 PREALARM = "prealarm"
@@ -223,10 +224,14 @@ class AlarmRun:
         return ALARM not in self.decisions
 
 
-def _alarm_runs(times: list[float], decisions: list[str]) -> list[AlarmRun]:
+def _alarm_runs(times: list[float], decisions: list[str], max_gap_s: float = 60.0) -> list[AlarmRun]:
     out: list[AlarmRun] = []
     cur: AlarmRun | None = None
+    previous = None
     for t, d in zip(times, decisions, strict=True):
+        if previous is not None and t - previous > max_gap_s:
+            cur = None
+        previous = t
         if d in (ALARM, PREALARM):
             if cur is None:
                 cur = AlarmRun(t, t, [d])
@@ -250,7 +255,9 @@ def evaluate_alarm_policies(
     (first ALARM inside the event), prealarm-only runs, abstentions.
     None = unmeasurable on this data (zero events or zero alarm runs)."""
     label_cfg = label_cfg or LabelConfig()
-    segs = event_segments(rows, label_cfg)
+    rows = sorted(rows, key=lambda r: float(r["ts"]))
+    max_gap = max(3 * median_interval(rows), 10.0)
+    segs = event_segments(rows, label_cfg, max_gap)
     times = [float(r["ts"]) for r in rows]
 
     def in_event(t: float) -> bool:
@@ -260,11 +267,15 @@ def evaluate_alarm_policies(
     for policy in policies:
         policy.reset()
         decisions: list[str] = []
+        previous = None
         for row in rows:
+            if previous is not None and float(row["ts"]) - previous > max_gap:
+                policy.reset()
+            previous = float(row["ts"])
             s = sample_from_row(row)
             decisions.append(policy.observe(s, float(row["ts"])).decision)
 
-        runs = _alarm_runs(times, decisions)
+        runs = _alarm_runs(times, decisions, max_gap)
         alarm_runs = [r for r in runs if not r.is_prealarm_only]
         n_events = len(segs)
         detected = 0
@@ -278,10 +289,11 @@ def evaluate_alarm_policies(
                 detected += 1
                 delays.append(inside[0] - seg.start_ts)
         false_runs = [
-            r for r in runs
-            if not in_event(r.start_ts) and not in_event(r.end_ts)
+            r for r in alarm_runs
+            if not any(r.start_ts <= s.end_ts and r.end_ts >= s.start_ts for s in segs)
         ]
-        span_h = (times[-1] - times[0]) / 3600.0 if times else 0.0
+        span_h = sum(b - a for a, b in zip(times, times[1:])
+                     if 0 < b - a <= max_gap) / 3600.0
         n_true_alarm_runs = len(alarm_runs) - len(false_runs)
         precision = (
             n_true_alarm_runs / len(alarm_runs) if alarm_runs else None

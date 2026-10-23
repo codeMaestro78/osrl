@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import time as _time
 from pathlib import Path
 
 import streamlit as st
@@ -17,6 +16,8 @@ st.set_page_config(
         "About": "**OS-RL Agent** — PSI-aware RL watchdog for Ubuntu laptops.",
     },
 )
+
+st.set_option("client.showSidebarNavigation", False)
 
 # ── Premium Animated CSS ──────────────────────────────────────────────────────
 st.markdown("""
@@ -118,7 +119,7 @@ section[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
 }
 [data-testid="stMetric"]:hover::before { left: 100%; }
 [data-testid="stMetricLabel"] {
-    color: #475569 !important;
+    color: #94a3b8 !important;
     font-size: 10px !important;
     letter-spacing: 1px;
     text-transform: uppercase;
@@ -174,7 +175,7 @@ section[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
     backdrop-filter: blur(8px);
 }
 .stTabs [data-baseweb="tab"] {
-    color: #475569 !important;
+    color: #94a3b8 !important;
     border-radius: 9px;
     font-weight: 500;
     font-size: 13px;
@@ -387,7 +388,35 @@ code {
 }
 
 /* ── Caption ── */
-.stCaption { color: #475569 !important; font-size: 12px !important; }
+.stCaption { color: #94a3b8 !important; font-size: 12px !important; }
+
+/* Legibility, keyboard focus, narrow layouts and reduced motion. */
+[data-testid="stMetricLabel"], .stCaption { color: #94a3b8 !important; }
+button:focus-visible, a:focus-visible, input:focus-visible,
+[role="tab"]:focus-visible { outline: 2px solid #7dd3fc !important; outline-offset: 3px; }
+/* Frequently refreshed data should not replay entrance animations. */
+main *, main *::before, main *::after { animation:none !important; }
+.telemetry-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+.telemetry-grid > div { min-width:0; }
+@media (max-width:1100px) {
+    .telemetry-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+.status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; }
+[data-testid="stMarkdownContainer"] { overflow-wrap:anywhere; }
+@media (max-width:640px) {
+    .block-container { padding:1rem 0.75rem; }
+    [data-testid="stHorizontalBlock"] { flex-wrap:wrap; gap:0.75rem; }
+    [data-testid="stColumn"] { min-width:0 !important; flex:1 1 100% !important; width:100% !important; }
+    .status-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .status-grid > div, .telemetry-grid > div { padding:12px !important; min-width:0; }
+    [data-testid="stMetricValue"] { font-size:20px !important; }
+    [data-testid="stMarkdownContainer"] div[style*="display:flex"] { flex-wrap:wrap; }
+    [data-testid="stMarkdownContainer"] span { white-space:normal !important; }
+    .stTabs [data-baseweb="tab-list"] { overflow-x:auto; }
+}
+@media (prefers-reduced-motion:reduce) {
+    *, *::before, *::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -407,6 +436,7 @@ from osrl.dashboard.pages import (  # noqa: E402
     agent,
     data_explorer,
     history,
+    evaluation,
     overview,
     processes,
     training,
@@ -417,6 +447,7 @@ PAGES = {
     "🖥️ Overview":    overview,
     "⚙️ Processes":   processes,
     "🔬 Data Explorer": data_explorer,
+    "🧪 Evaluation": evaluation,
     "🤖 Agent":       agent,
     "🏋️ Training":    training,
     "📅 History":     history,
@@ -436,7 +467,7 @@ with st.sidebar:
                     -webkit-background-clip:text;-webkit-text-fill-color:transparent;
                     background-clip:text;
                     animation:gradient-shift 4s ease infinite'>OS-RL Agent</div>
-        <div style='font-size:0.65rem;color:#334155;margin-top:3px;
+        <div style='font-size:0.65rem;color:#94a3b8;margin-top:3px;
                     letter-spacing:2px;text-transform:uppercase;font-weight:600'>
             PSI-AWARE RL WATCHDOG
         </div>
@@ -462,7 +493,7 @@ with st.sidebar:
     db_expanded = str(Path(db_path).expanduser())
     st.markdown(f"""
     <div style='padding:4px 0;animation:fade-in 0.8s ease-out'>
-        <div style='color:#334155;text-transform:uppercase;letter-spacing:1px;
+        <div style='color:#94a3b8;text-transform:uppercase;letter-spacing:1px;
                     font-size:9px;font-weight:700;margin-bottom:6px'>Database</div>
         <code style='font-size:10px;color:#38bdf8;word-break:break-all;
                      background:rgba(56,189,248,0.06);border-color:rgba(56,189,248,0.2);
@@ -475,7 +506,7 @@ with st.sidebar:
 
     # Auto-refresh slider
     st.markdown("""
-    <div style='color:#334155;text-transform:uppercase;letter-spacing:1px;
+    <div style='color:#94a3b8;text-transform:uppercase;letter-spacing:1px;
                 font-size:9px;font-weight:700;margin-bottom:8px'>Auto-Refresh Interval</div>
     """, unsafe_allow_html=True)
     refresh_s = st.select_slider(
@@ -512,7 +543,7 @@ with st.sidebar:
                         border:1px solid rgba(56,189,248,0.12)'>
                 <div style='font-size:16px;font-weight:800;color:#38bdf8;
                             font-family:JetBrains Mono,monospace'>{_n:,}</div>
-                <div style='font-size:9px;color:#334155;text-transform:uppercase;
+                <div style='font-size:9px;color:#94a3b8;text-transform:uppercase;
                             letter-spacing:0.5px;margin-top:2px'>samples</div>
             </div>
             <div style='flex:1;text-align:center;padding:8px;
@@ -520,7 +551,7 @@ with st.sidebar:
                         border:1px solid rgba(129,140,248,0.12)'>
                 <div style='font-size:16px;font-weight:800;color:#818cf8;
                             font-family:JetBrains Mono,monospace'>{_ev:,}</div>
-                <div style='font-size:9px;color:#334155;text-transform:uppercase;
+                <div style='font-size:9px;color:#94a3b8;text-transform:uppercase;
                             letter-spacing:0.5px;margin-top:2px'>events</div>
             </div>
         </div>
@@ -555,7 +586,7 @@ if is_demo():
             </div>
             <div style='color:#64748b;font-size:11px'>{_detail}</div>
         </div>
-        <div style='margin-left:auto;color:#475569;font-size:10px;max-width:360px;text-align:right'>
+        <div style='margin-left:auto;color:#94a3b8;font-size:10px;max-width:360px;text-align:right'>
             Real telemetry from a developer workstation. Run the collector
             locally for live host monitoring.
         </div>

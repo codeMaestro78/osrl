@@ -11,7 +11,7 @@ import streamlit as st
 from osrl.dashboard.shared import ensure_rollups, get_conn, recent_rollups
 
 _BG, _PLOT = "rgba(0,0,0,0)", "rgba(6,13,26,0.95)"
-_FONT = dict(color="#64748b", size=11, family="Inter")
+_FONT = dict(color="#94a3b8", size=11, family="Inter")
 _GRID = "rgba(56,189,248,0.05)"
 _CHART = dict(
     paper_bgcolor=_BG, plot_bgcolor=_PLOT, font=_FONT,
@@ -65,29 +65,29 @@ def render() -> None:
             return
 
         st.markdown(f"""
-        <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:10px;
+        <div class='status-grid' style='
                     margin-bottom:4px;animation:fade-in 0.5s ease-out'>
             <div style='background:rgba(10,20,45,0.9);border:1px solid rgba(56,189,248,0.15);
                         border-radius:12px;padding:14px;text-align:center'>
-                <div style='color:#334155;font-size:9px;text-transform:uppercase;letter-spacing:1px'>15-min Windows</div>
+                <div style='color:#94a3b8;font-size:9px;text-transform:uppercase;letter-spacing:1px'>15-min Windows</div>
                 <div style='color:#38bdf8;font-size:22px;font-weight:800;
                             font-family:JetBrains Mono,monospace'>{n_roll}</div>
             </div>
             <div style='background:rgba(10,20,45,0.9);border:1px solid rgba(129,140,248,0.15);
                         border-radius:12px;padding:14px;text-align:center'>
-                <div style='color:#334155;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Total Samples</div>
+                <div style='color:#94a3b8;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Total Samples</div>
                 <div style='color:#818cf8;font-size:22px;font-weight:800;
                             font-family:JetBrains Mono,monospace'>{n_samp:,}</div>
             </div>
             <div style='background:rgba(10,20,45,0.9);border:1px solid rgba(34,197,94,0.15);
                         border-radius:12px;padding:14px;text-align:center'>
-                <div style='color:#334155;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Data Span</div>
+                <div style='color:#94a3b8;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Data Span</div>
                 <div style='color:#22c55e;font-size:22px;font-weight:800;
                             font-family:JetBrains Mono,monospace'>{span_h:.1f}h</div>
             </div>
             <div style='background:rgba(10,20,45,0.9);border:1px solid rgba(251,146,60,0.15);
                         border-radius:12px;padding:14px;text-align:center'>
-                <div style='color:#334155;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Avg/Window</div>
+                <div style='color:#94a3b8;font-size:9px;text-transform:uppercase;letter-spacing:1px'>Avg/Window</div>
                 <div style='color:#fb923c;font-size:22px;font-weight:800;
                             font-family:JetBrains Mono,monospace'>{n_samp//max(1,n_roll)}</div>
             </div>
@@ -235,7 +235,7 @@ def render() -> None:
         hours = [f"{h:02d}:00" for h in range(24)]
 
         # Fill NaN with 0
-        matrix = np.nan_to_num(matrix, nan=0.0)
+        # Missing hour buckets remain gaps, never idle measurements.
 
         fig = go.Figure(go.Heatmap(
             z=matrix, x=hours, y=days,
@@ -246,18 +246,18 @@ def render() -> None:
                 [1.0,  "rgba(239,68,68,1)"],
             ],
             zmid=40,
-            text=[[f"{matrix[i][j]:.0f}%" for j in range(24)] for i in range(7)],
+            text=[[f"{matrix[i][j]:.0f}%" if np.isfinite(matrix[i][j]) else "" for j in range(24)] for i in range(7)],
             texttemplate="%{text}", textfont=dict(size=9, color="rgba(255,255,255,0.7)"),
-            colorbar=dict(thickness=12, tickfont=dict(size=10, color="#64748b"),
-                         title=dict(text="CPU %", font=dict(size=10, color="#64748b"))),
+            colorbar=dict(thickness=12, tickfont=dict(size=10, color="#94a3b8"),
+                         title=dict(text="CPU %", font=dict(size=10, color="#94a3b8"))),
             hoverongaps=False,
         ))
         fig.update_layout(
             height=280, margin=dict(t=44, b=60, l=50, r=20),
             paper_bgcolor=_BG, font=_FONT,
             title="Average CPU % — Hour of Day × Day of Week",
-            xaxis=dict(tickangle=-35, tickfont=dict(size=9, color="#475569")),
-            yaxis=dict(tickfont=dict(size=10, color="#475569")),
+            xaxis=dict(tickangle=-35, tickfont=dict(size=9, color="#94a3b8")),
+            yaxis=dict(tickfont=dict(size=10, color="#94a3b8")),
         )
         st.plotly_chart(fig, key="heatmap_cpu", width="stretch")
 
@@ -280,7 +280,7 @@ def render() -> None:
         limit = cf2.select_slider("Rows", [25, 50, 100, 200, 500], value=50,
                                   key="hist_limit")
         cf3.markdown("<br>", unsafe_allow_html=True)
-        cf3.markdown(f"<div style='color:#475569;font-size:12px;padding-top:8px'>{len(all_kinds)} kinds</div>",
+        cf3.markdown(f"<div style='color:#94a3b8;font-size:12px;padding-top:8px'>{len(all_kinds)} kinds</div>",
                     unsafe_allow_html=True)
 
         if kind_filter:
@@ -308,7 +308,7 @@ def render() -> None:
                 y=[k[1] for k in kc_sorted],
                 marker_color="#38bdf8", opacity=0.8,
                 text=[str(k[1]) for k in kc_sorted],
-                textposition="outside", textfont=dict(size=10, color="#64748b"),
+                textposition="outside", textfont=dict(size=10, color="#94a3b8"),
             ))
             fig.update_layout(**_chart(
                 height=200,
@@ -353,12 +353,12 @@ def render() -> None:
                 f"<div style='display:flex;gap:10px;align-items:center;padding:6px 12px;"
                 f"margin:2px 0;border-radius:7px;background:rgba(8,15,31,0.7);"
                 f"border-left:3px solid {color};'>"
-                f"<code style='color:#334155;font-size:10px;white-space:nowrap;"
+                f"<code style='color:#94a3b8;font-size:10px;white-space:nowrap;"
                 f"font-family:JetBrains Mono,monospace'>{ts_s}</code>"
                 f"<span style='font-size:13px'>{icon}</span>"
                 f"<span style='color:{color};font-size:11px;font-weight:600;"
                 f"white-space:nowrap'>{kind}</span>"
-                f"<span style='color:#475569;font-size:11px;flex:1'>{detail}</span>"
+                f"<span style='color:#94a3b8;font-size:11px;flex:1'>{detail}</span>"
                 f"</div>",
                 unsafe_allow_html=True,
             )

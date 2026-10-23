@@ -91,7 +91,8 @@ def _psi_ratio(sample: Sample, resource: str) -> tuple[float, float]:
         return 0.0, 0.0
     stall = getattr(psi, "some_stall_us", None)
     interval = sample.interval_s
-    if stall is None or interval is None or interval <= 0:
+    if (stall is None or interval is None or not math.isfinite(stall)
+            or not math.isfinite(interval) or interval <= 0 or stall < 0):
         return 0.0, 0.0
     ratio = stall / (interval * 1e6)
     return float(np.clip(ratio, 0.0, 1.0)), 1.0
@@ -198,7 +199,8 @@ def encode_obs(window: list[Sample], agent: AgentState) -> np.ndarray:
         psi = getattr(s, psi_attr, None)
         full_stall = getattr(psi, "full_stall_us", None) if psi else None
         interval = s.interval_s
-        if full_stall is not None and interval and interval > 0:
+        if (full_stall is not None and interval and interval > 0
+                and math.isfinite(full_stall) and math.isfinite(interval)):
             ratio = full_stall / (interval * 1e6)
             obs[idx] = float(np.clip(ratio, 0.0, 1.0))
             valid[vidx] = 1.0
@@ -236,7 +238,7 @@ def encode_obs(window: list[Sample], agent: AgentState) -> np.ndarray:
     # ------------------------------------------------------------------
     percpu = s.cpu_percpu_pct or []
     for i in range(NCPU_MAX):
-        if i < len(percpu) and percpu[i] is not None:
+        if i < len(percpu) and percpu[i] is not None and math.isfinite(percpu[i]):
             obs[idx] = float(np.clip(percpu[i] / 100.0, 0.0, 1.0))
             valid[vidx] = 1.0
         idx += 1; vidx += 1
@@ -265,10 +267,20 @@ def encode_obs(window: list[Sample], agent: AgentState) -> np.ndarray:
     # ------------------------------------------------------------------
     # Block 6: Deltas [46:52]
     # ------------------------------------------------------------------
+    first = window[0] if len(window) > 1 else None
+    previous = {} if first is None else {
+        "cpu": first.cpu_total_pct, "swap_pct": first.swap_used_pct,
+        "psi_mem": _psi_ratio(first, "mem")[0] if _psi_ratio(first, "mem")[1] else None,
+        "swp_out": first.swp_out_ps,
+        "mem_avail": first.mem_available_bytes / 1024**2
+                     if first.mem_available_bytes is not None else None,
+        "alloc": first.allocstall_ps,
+    }
+
     def _delta_norm(key: str, cur: float | None, lo: float, hi: float
                     ) -> tuple[float, float]:
-        prev_val = agent._prev_features.get(key)
-        if cur is None or prev_val is None:
+        prev_val = previous.get(key)
+        if cur is None or prev_val is None or not math.isfinite(cur) or not math.isfinite(prev_val):
             return 0.0, 0.0
         delta = cur - prev_val
         rng = max(hi - lo, 1e-9)
@@ -277,19 +289,16 @@ def encode_obs(window: list[Sample], agent: AgentState) -> np.ndarray:
     deltas = [
         ("cpu",       s.cpu_total_pct,            0.0,          100.0),
         ("swap_pct",  s.swap_used_pct,             0.0,          100.0),
-        ("psi_mem",   _psi_ratio(s, "mem")[0],     0.0,          1.0),
+        ("psi_mem",   _psi_ratio(s, "mem")[0] if _psi_ratio(s, "mem")[1] else None,     0.0,          1.0),
         ("swp_out",   s.swp_out_ps,                0.0,          _MAX_SWP_PS),
         ("mem_avail", mem_avail_mib,               0.0,          _MEM_TOTAL_MIB),
         ("alloc",     s.allocstall_ps,             0.0,          _MAX_ALLOC_PS),
     ]
-    cur_features: dict = {}
     for key, cur_val, lo, hi in deltas:
         v, f = _delta_norm(key, cur_val, lo, hi)
         obs[idx] = v; valid[vidx] = f; idx += 1; vidx += 1
-        if cur_val is not None:
-            cur_features[key] = cur_val
     # update rolling prev for next call
-    agent._prev_features.update(cur_features)
+    # Encoding is pure: repeated rendering/inference cannot change features.
 
     # ------------------------------------------------------------------
     # Block 7: Agent history [52:58]

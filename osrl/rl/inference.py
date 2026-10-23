@@ -5,8 +5,8 @@ Mode gate (stored in store.meta['agent_mode'], written by Streamlit):
   observe   — inference runs, suggestions recorded to events, NO intents written
   advise    — suggestions written to intents table (status='pending');
               human approves from dashboard
-  autopilot — intent written AND immediately claimed by the inference worker;
-              guard/worker/executor chain is the last safety gate
+  autopilot — eligible intents are queued; a separate worker still needs
+              explicit --execute approval before the guard/executor chain
 
 Structural guarantees:
   - This module NEVER imports osrl.guard, osrl.worker, osrl.executor.
@@ -36,6 +36,7 @@ except ImportError as e:
 if TYPE_CHECKING:
     from osrl.store import Store
 
+from osrl.rl.artifacts import is_validated, normalization_path
 from osrl.rl.mask import NOOP, RENICE_BACK, action_name, compute_action_mask
 from osrl.rl.obs import OBS_DIM, AgentState, encode_obs
 
@@ -86,9 +87,11 @@ class PolicyInference:
     def _load(self, vecnorm_path: str | Path | None) -> None:
         best = self.checkpoint_dir / "best"
         if not best.exists():
+            best = self.checkpoint_dir / "latest"
+        if not best.exists():
             return   # no checkpoint yet; inference will return NOOP
         ckpt = str(best)
-        self._validated = "VALIDATED" in (best.resolve().name)
+        self._validated = is_validated(best)
         self._ckpt_path = str(best.resolve())
 
         # Minimal dummy env to satisfy SB3 load API (obs/action space only)
@@ -102,7 +105,10 @@ class PolicyInference:
             def step(self, a): return np.zeros(OBS_DIM, np.float32), 0.0, True, False, {}
 
         dummy = DummyVecEnv([lambda: _MinimalEnv()])
-        vn_path = vecnorm_path or self.checkpoint_dir / "vecnorm.pkl"
+        vn_path = vecnorm_path or normalization_path(best)
+        if not Path(str(vn_path)).exists():
+            dummy.close()
+            return  # A normalized model cannot safely consume raw observations.
         if Path(str(vn_path)).exists():
             self._vecnorm = VecNormalize.load(str(vn_path), dummy)
             self._vecnorm.training = False
@@ -122,6 +128,8 @@ class PolicyInference:
         mode: str = "observe",
     ) -> ActionSuggestion:
         """Run policy inference for the current observation window."""
+        if mode not in VALID_MODES:
+            mode = "observe"
         obs = encode_obs(window, agent)
         mask = compute_action_mask(agent)
 
@@ -141,7 +149,7 @@ class PolicyInference:
             obs_in = self._vecnorm.normalize_obs(obs_in)
 
         action, _states = self._model.predict(
-            obs_in, action_masks=mask.reshape(1, -1), deterministic=False
+            obs_in, action_masks=mask.reshape(1, -1), deterministic=True
         )
         action_idx = int(action[0]) if hasattr(action, "__len__") else int(action)
 
@@ -150,7 +158,7 @@ class PolicyInference:
             import torch
             with torch.no_grad():
                 obs_t = torch.tensor(obs_in, dtype=torch.float32)
-                dist = self._model.policy.get_distribution(obs_t)
+                dist = self._model.policy.get_distribution(obs_t, action_masks=mask.reshape(1, -1))
                 probs = dist.distribution.probs.numpy().flatten()
             prob = float(probs[action_idx])
         except Exception:  # noqa: BLE001
@@ -180,8 +188,19 @@ class PolicyInference:
         target. The guard chain validates ownership and identity before any
         execution.
         """
-        if suggestion.agent_mode == "observe":
+        if store is not None:
+            import math
+            store.record_event(suggestion.ts, "policy_suggestion", {
+                "action": suggestion.action_name, "mode": suggestion.agent_mode,
+                "probability": suggestion.probability if math.isfinite(suggestion.probability) else None,
+                "validated": suggestion.validated, "checkpoint": suggestion.checkpoint_path,
+            })
+        if suggestion.agent_mode not in ("advise", "autopilot") or not suggestion.validated:
             return None  # advisory only; record suggestion to events below
+        if (not self._validated or suggestion.checkpoint_path != self._ckpt_path
+                or time.time() - suggestion.ts > 12 or suggestion.ts > time.time()
+                or not suggestion.mask[RENICE_BACK]):
+            return None
         if suggestion.action == NOOP:
             return None  # NOOP never writes an intent
         if suggestion.action != RENICE_BACK:
@@ -225,7 +244,7 @@ _PROTECTED_NAMES = frozenset({
 
 def _pick_renice_target(top_procs: list[dict]) -> dict | None:
     """Pick the highest-CPU process that is not protected and has nice >= 0."""
-    for proc in top_procs:
+    for proc in sorted(top_procs, key=lambda p: float(p.get("cpu_pct") or 0), reverse=True):
         name = str(proc.get("name", "")).lower()
         if any(p in name for p in _PROTECTED_NAMES):
             continue

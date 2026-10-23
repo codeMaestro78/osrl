@@ -80,3 +80,14 @@ def test_missing_data_bootstraps_empty_schema(tmp_path, monkeypatch):
     }
     assert {"samples", "events", "rollups", "actions_ledger", "intents"} <= tables
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_auto_selected_demo_stays_demo_after_entrypoint_sets_osrl_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("OSRL_DB", raising=False)
+    _set_work_dir(monkeypatch, tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "demo_telemetry.db").write_bytes(b"snapshot" * 10)
+    selected = bootstrap.bootstrap_database(tmp_path)
+    monkeypatch.setenv("OSRL_DB", selected)
+    assert bootstrap.bootstrap_database(tmp_path) == selected
+    assert os.environ.get("OSRL_DEMO") == "1"

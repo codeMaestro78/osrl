@@ -15,7 +15,6 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
 
 import streamlit as st
 
@@ -48,7 +47,7 @@ def training_available() -> bool:
 
 def checkpoint_dir() -> Path:
     """Resolve the checkpoint directory (env override -> repo -> home)."""
-    env = os.environ.get("OSRL_CHECKPOINT_DIR")
+    env = os.environ.get("OSRL_RL_CHECKPOINT_DIR") or os.environ.get("OSRL_CHECKPOINT_DIR")
     if env:
         return Path(env).expanduser()
     repo = _REPO_ROOT / "checkpoints"
@@ -69,7 +68,9 @@ def _resolve_db() -> str:
 def get_conn() -> sqlite3.Connection:
     """Single shared SQLite connection. Lives for the lifetime of the server process."""
     path = _resolve_db()
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
+    from osrl.dashboard.bootstrap import ensure_schema
+    ensure_schema(Path(path))
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -199,9 +200,10 @@ def find_checkpoints() -> list[dict]:
     if not ckpt_dir.exists():
         return []
     ckpts = []
-    for p in ckpt_dir.iterdir():
+    for p in ckpt_dir.rglob("*.zip"):
         if p.suffix == ".zip" and p.is_file():
-            validated = "VALIDATED" in p.name and "UNVALIDATED" not in p.name
+            from osrl.rl.artifacts import is_validated
+            validated = is_validated(p)
             steps = 0
             if "step" in p.name:
                 try:
@@ -221,6 +223,12 @@ def find_checkpoints() -> list[dict]:
 
 def best_checkpoint() -> dict | None:
     ckpts = find_checkpoints()
+    for name in ("best", "latest"):
+        link = checkpoint_dir() / name
+        if link.exists():
+            selected = next((c for c in ckpts if Path(c["path"]).resolve() == link.resolve()), None)
+            if selected:
+                return selected
     # Prefer VALIDATED, otherwise latest
     validated = [c for c in ckpts if c["validated"]]
     return validated[0] if validated else (ckpts[0] if ckpts else None)
@@ -334,3 +342,20 @@ def ensure_rollups(conn: sqlite3.Connection) -> None:
                 pass
         t = t_end
     conn.commit()
+
+
+def render_action_ledger(conn: sqlite3.Connection, limit: int = 30) -> None:
+    """Display the real schema, including failures and guard decisions."""
+    rows = recent_actions(conn, limit)
+    st.caption("Guarded worker attempts. Execution requires an explicit worker invocation with --execute.")
+    if not rows:
+        st.info("No action attempts recorded. Changing agent mode alone does not start execution.")
+        return
+    st.dataframe([{
+        "Time": fmt_ts(r["created_ts"]), "PID": r["target_pid"],
+        "Action": r["kind"], "Status": r["status"],
+        "Nice before": r["before_nice"], "Nice applied": r["applied_nice"],
+        "Reason": r["error"] or "", "Intent": r["intent_id"],
+    } for r in rows], hide_index=True, width="stretch")
+    with st.expander("Guard audit details"):
+        st.json(rows)

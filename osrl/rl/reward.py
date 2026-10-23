@@ -16,7 +16,7 @@ import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from osrl.collector import Sample
+    pass
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 _SWP_NORM_PS      = 2048.0        # pages/s — critical swap-out threshold
@@ -63,7 +63,9 @@ def _psi_stall_ratio(window: list, attr: str) -> float:
             continue
         stall_us = getattr(psi, 'some_stall_us', None)
         # Get interval from sample
-        interval_s = getattr(s, 'interval_s', None) or 2.0
+        interval_s = getattr(s, 'interval_s', None)
+        if interval_s is None or not math.isfinite(interval_s) or interval_s <= 0:
+            continue
         if stall_us is not None and stall_us >= 0:
             ratio = stall_us / (interval_s * 1e6)
             ratios.append(min(ratio, 1.0))
@@ -97,7 +99,7 @@ def _swap_urgency(window: list) -> float:
     pcts = [_safe(s.swap_used_pct) for s in window if s.swap_used_pct is not None]
     if not pcts:
         return 0.0
-    mean_pct = sum(pcts) / len(pcts) / 100.0  # 0..1
+    mean_pct = max(0.0, min(1.0, sum(pcts) / len(pcts) / 100.0))  # 0..1
     # Exponential: f(x) = e^(3x) - 1, normalised so f(1)=1
     return min((math.exp(3.0 * mean_pct) - 1.0) / (math.exp(3.0) - 1.0), 1.0)
 
@@ -131,7 +133,7 @@ def _oom_proximity_penalty(window: list) -> float:
     penalty = 0.0
     for s in window:
         avail_mib = _safe(s.mem_available_bytes) / (1024.0 * 1024.0)
-        if avail_mib < _MEM_OOM_MIB and avail_mib > 0:
+        if s.mem_available_bytes is not None and 0 <= avail_mib < _MEM_OOM_MIB:
             # Severity: 1.0 at 0 MiB, 0.0 at OOM_THRESH MiB
             sev = 1.0 - avail_mib / _MEM_OOM_MIB
             penalty += sev ** 2  # quadratic
@@ -190,14 +192,14 @@ def _trend_component(window: list) -> float:
     
     swap_first  = _mean_safe(first,  'swap_used_pct')
     swap_second = _mean_safe(second, 'swap_used_pct')
-    if swap_first and swap_second:
+    if swap_first is not None and swap_second is not None:
         delta = (swap_first - swap_second) / 100.0  # positive = improving
         trend += delta * 1.5
     
     # Memory available trend  
     mem_first  = _mean_safe(first,  'mem_available_bytes')
     mem_second = _mean_safe(second, 'mem_available_bytes')
-    if mem_first and mem_second and mem_first > 0:
+    if mem_first is not None and mem_second is not None and mem_first > 0:
         delta = (mem_second - mem_first) / (mem_first + 1e-6)
         trend += min(max(delta, -1.0), 1.0) * 0.5
     

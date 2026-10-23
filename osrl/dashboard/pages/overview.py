@@ -16,7 +16,7 @@ from osrl.dashboard.shared import (
 
 # ── Shared chart theme ────────────────────────────────────────────────────────
 _BG, _PLOT = "rgba(0,0,0,0)", "rgba(6,13,26,0.95)"
-_FONT = dict(color="#64748b", size=11, family="Inter")
+_FONT = dict(color="#94a3b8", size=11, family="Inter")
 _GRID = "rgba(56,189,248,0.05)"
 _CHART = dict(
     paper_bgcolor=_BG, plot_bgcolor=_PLOT, font=_FONT,
@@ -34,7 +34,7 @@ def _sparkline(vals: list, color: str = "#38bdf8") -> go.Figure:
     fig = go.Figure(go.Scatter(
         y=vals, mode="lines",
         line=dict(color=color, width=1.5),
-        fill="tozeroy", fillcolor=color.replace(")", ",0.08)").replace("rgb", "rgba") if "rgb" in color else f"rgba(56,189,248,0.06)",
+        fill="tozeroy", fillcolor=color.replace(")", ",0.08)").replace("rgb", "rgba") if "rgb" in color else "rgba(56,189,248,0.06)",
     ))
     fig.update_layout(
         height=60, margin=dict(t=0, b=0, l=0, r=0),
@@ -48,12 +48,21 @@ def _sparkline(vals: list, color: str = "#38bdf8") -> go.Figure:
 
 def _gauge(label: str, pct: float, warn: float = 20.0, unit: str = "%") -> go.Figure:
     """Animated semicircle gauge."""
-    if pct > warn * 2:
-        bar_color, glow = "#ef4444", "rgba(239,68,68,0.3)"
+    if pct is None or not math.isfinite(pct):
+        fig = go.Figure()
+        fig.add_annotation(text=f"{label}<br>Unavailable", showarrow=False,
+                           font=dict(color="#94a3b8", size=16))
+        fig.update_layout(height=210, paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return fig
+    critical = min(warn * 2, 100.0)
+    if pct > critical:
+        bar_color = "#ef4444"
     elif pct > warn:
-        bar_color, glow = "#f97316", "rgba(249,115,22,0.2)"
+        bar_color = "#f97316"
     else:
-        bar_color, glow = "#22c55e", "rgba(34,197,94,0.2)"
+        bar_color = "#22c55e"
 
     fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
@@ -70,8 +79,8 @@ def _gauge(label: str, pct: float, warn: float = 20.0, unit: str = "%") -> go.Fi
             "borderwidth": 0,
             "steps": [
                 {"range": [0, warn],       "color": "rgba(34,197,94,0.06)"},
-                {"range": [warn, warn*2],  "color": "rgba(249,115,22,0.06)"},
-                {"range": [warn*2, 100],   "color": "rgba(239,68,68,0.06)"},
+                {"range": [warn, critical],  "color": "rgba(249,115,22,0.06)"},
+                {"range": [critical, 100],   "color": "rgba(239,68,68,0.06)"},
             ],
             "threshold": {
                 "line": {"color": "#f97316", "width": 2},
@@ -99,11 +108,11 @@ def _metric_card(label: str, value: str, sub: str = "", color: str = "#38bdf8",
     <div style='position:absolute;top:0;right:0;width:60px;height:60px;
                 background:radial-gradient(circle at center,{color}18,transparent);
                 border-radius:0 14px 0 100%;'></div>
-    <div style='font-size:10px;color:#334155;text-transform:uppercase;
-                letter-spacing:1.5px;font-weight:700;margin-bottom:6px'>{icon} {label}</div>
+    <div style='font-size:12px;color:#94a3b8;text-transform:uppercase;
+                letter-spacing:0.6px;font-weight:600;margin-bottom:6px'>{icon} {label}</div>
     <div style='font-size:22px;font-weight:800;color:#f1f5f9;
                 font-family:"JetBrains Mono",monospace;letter-spacing:-0.5px'>{value}</div>
-    {f"<div style='font-size:11px;color:#475569;margin-top:3px'>{sub}</div>" if sub else ""}
+    {f"<div style='font-size:11px;color:#94a3b8;margin-top:3px'>{sub}</div>" if sub else ""}
 </div>"""
 
 
@@ -152,7 +161,7 @@ def render() -> None:
                     source_card = _metric_card("Daemon", "🟢 Live", ago(hb["ts"]), "#22c55e", "●")
 
                 st.markdown(f"""
-                <div style='display:grid;grid-template-columns:repeat(5,1fr);gap:10px;
+                <div class='status-grid' style='
                             margin-bottom:4px;animation:fade-in 0.5s ease-out'>
                     {source_card}
                     {_metric_card("Risk Level", risk, "", r_col, "⚡")}
@@ -169,40 +178,45 @@ def render() -> None:
         st.divider()
 
         # ── Key system metrics ────────────────────────────────────────────────
-        cpu       = safe_float(s, "cpu_total_pct")
-        mem_avail = safe_float(s, "mem_available_bytes") / 1024**3
-        mem_pct   = safe_float(s, "mem_used_pct")
-        swap_pct  = safe_float(s, "swap_used_pct")
-        swp_out   = safe_float(s, "swp_out_ps")
-        gpu_util  = safe_float(s, "gpu_util_pct")
-        gpu_mem   = safe_float(s, "gpu_mem_used_mib")
-        gpu_temp  = safe_float(s, "gpu_temp_c")
-        load1     = safe_float(s, "load1")
+        cpu       = safe_float(s, "cpu_total_pct", float("nan"))
+        mem_avail = safe_float(s, "mem_available_bytes", float("nan")) / 1024**3
+        mem_pct   = safe_float(s, "mem_used_pct", float("nan"))
+        swap_pct  = safe_float(s, "swap_used_pct", float("nan"))
+        swp_out   = safe_float(s, "swp_out_ps", float("nan"))
+        gpu_util  = safe_float(s, "gpu_util_pct", float("nan"))
+        gpu_mem   = safe_float(s, "gpu_mem_used_mib", float("nan"))
+        gpu_temp  = safe_float(s, "gpu_temp_c", float("nan"))
 
-        cols = st.columns(8)
         metrics = [
             ("CPU",       f"{cpu:.1f}%",       "",            "#38bdf8", "💻", cpu > 80),
             ("RAM Avail", f"{mem_avail:.1f}GB", f"Used {mem_pct:.0f}%",  "#22c55e", "🧠", mem_avail < 0.5),
             ("RAM Used",  f"{mem_pct:.0f}%",   "",            "#a78bfa", "📊", mem_pct > 85),
-            ("Swap",      f"{swap_pct:.0f}%",  "",            "#fb923c", "💾", swap_pct > 80),
+            ("Swap",      f"{swap_pct:.0f}%",  "occupancy",   "#fb923c", "💾", False),
             ("Swap-Out",  f"{swp_out:.0f}",    "pages/s",     "#f43f5e", "⚠️", swp_out > 500),
             ("GPU Util",  f"{gpu_util:.0f}%",  "",            "#818cf8", "🎮", gpu_util > 95),
             ("VRAM",      f"{gpu_mem:.0f}MiB", "",            "#c084fc", "🔮", False),
             ("GPU Temp",  f"{gpu_temp:.0f}°C", "",            "#f97316", "🌡️", gpu_temp > 85),
         ]
-        for col, (lbl, val, sub, color, icon, alert) in zip(cols, metrics):
-            col.markdown(_metric_card(lbl, val, sub, color, icon, alert), unsafe_allow_html=True)
+        cards = []
+        for lbl, val, sub, color, icon, alert in metrics:
+            if "nan" in val:
+                val, sub = "—", "Unavailable"
+            cards.append(_metric_card(lbl, val, sub, color, icon, alert))
+        st.markdown("<div class='telemetry-grid'>" + "".join(cards) + "</div>",
+                    unsafe_allow_html=True)
 
         st.divider()
 
         # ── PSI Gauges ────────────────────────────────────────────────────────
-        st.subheader("⚡ Pressure Stall Index — Live")
-        st.caption("Real-time kernel PSI stall percentages — >20% indicates system under pressure")
+        st.subheader("Pressure Stall Information")
+        st.caption("Kernel PSI stall percentages for the latest sample. Unavailable readings are not zero.")
 
-        interval = safe_float(s, "interval_s", 2.0)
-        def _stall(key: str) -> float:
-            v = safe_float(s, key)
-            return v / (interval * 1e6) * 100 if interval > 0 and v > 0 else 0.0
+        interval = s.get("interval_s")
+        def _stall(key: str) -> float | None:
+            value = s.get(key)
+            if value is None or interval is None or interval <= 0:
+                return None
+            return float(value) / (interval * 1e6) * 100
 
         cpu_stall = _stall("psi_cpu_some_stall_us")
         mem_stall = _stall("psi_mem_some_stall_us")
@@ -236,8 +250,8 @@ def render() -> None:
         def _col(key):   return [r.get(key) for r in rows]
         def _psi(key):
             return [
-                (float(r[key]) / ((r.get("interval_s") or 2.0) * 1e6) * 100)
-                if r.get(key) else None
+                (float(r[key]) / (r["interval_s"] * 1e6) * 100)
+                if r.get(key) is not None and r.get("interval_s") and r["interval_s"] > 0 else None
                 for r in rows
             ]
 
@@ -249,7 +263,7 @@ def render() -> None:
         gpu_mem_v = _col("gpu_mem_used_mib")
         gpu_pwr_v = _col("gpu_power_w")
         gpu_tmp_v = _col("gpu_temp_c")
-        mem_avl   = [(r.get("mem_available_bytes") or 0) / 1024**3 for r in rows]
+        mem_avl   = [r["mem_available_bytes"] / 1024**3 if r.get("mem_available_bytes") is not None else None for r in rows]
         load1_v   = _col("load1")
         load5_v   = _col("load5")
         load15_v  = _col("load15")
@@ -257,7 +271,7 @@ def render() -> None:
         psi_mem   = _psi("psi_mem_some_stall_us")
         psi_io    = _psi("psi_io_some_stall_us")
 
-        st.subheader("📈 Live Telemetry — Last 5 Minutes")
+        st.subheader("📈 Recent Telemetry — Latest 180 Samples")
         tabs = st.tabs(["💻 CPU & GPU", "💾 Memory & Swap", "⚡ PSI All", "⚖️ Load Avg", "🎮 GPU Detail", "🧠 Memory Detail"])
 
         def _line(fig, x, y, name, color, dash="solid", width=2, yaxis=None, fill=False):
@@ -266,14 +280,14 @@ def render() -> None:
             if yaxis: kw["yaxis"] = yaxis
             if fill:
                 kw["fill"] = "tozeroy"
-                kw["fillcolor"] = color.replace("rgb", "rgba").replace(")", ",0.06)") if "rgb" in color else f"rgba(56,189,248,0.06)"
+                kw["fillcolor"] = color.replace("rgb", "rgba").replace(")", ",0.06)") if "rgb" in color else "rgba(56,189,248,0.06)"
             fig.add_scatter(**kw)
 
         # ── Tab 1: CPU & GPU ──────────────────────────────────────────────────
         with tabs[0]:
             fig = go.Figure()
             _line(fig, ts_fmt, cpu_v,  "CPU %",   "#38bdf8", fill=True)
-            if any(gpu_v): _line(fig, ts_fmt, gpu_v, "GPU %", "#818cf8", dash="dot")
+            if any(v is not None for v in gpu_v): _line(fig, ts_fmt, gpu_v, "GPU %", "#818cf8", dash="dot")
             fig.add_hline(y=80, line_color="rgba(239,68,68,0.5)", line_dash="dot",
                          line_width=1, annotation_text="80% warn", annotation_font_color="#ef4444")
             fig.update_layout(**_CHART, title="CPU & GPU Utilisation %", yaxis_range=[0, 105])
@@ -316,9 +330,9 @@ def render() -> None:
 
         # ── Tab 5: GPU Detail (2 charts) ──────────────────────────────────────
         with tabs[4]:
-            if not any(gpu_v):
+            if not any(v is not None for v in gpu_v):
                 st.markdown("""
-                <div style='text-align:center;padding:40px;color:#334155'>
+                <div style='text-align:center;padding:40px;color:#94a3b8'>
                     <div style='font-size:3rem;margin-bottom:8px'>🎮</div>
                     <div>No GPU data — NVML not detected or no dedicated GPU</div>
                 </div>""", unsafe_allow_html=True)
@@ -413,7 +427,7 @@ def render() -> None:
                 f"background:linear-gradient(135deg,rgba(10,20,45,0.8),rgba(15,30,60,0.5));"
                 f"border:1px solid {color}22;border-left:3px solid {color};"
                 f"animation:slide-in-up {0.3+delay:.2f}s ease-out;'>"
-                f"<code style='color:#334155;font-size:10px;white-space:nowrap;"
+                f"<code style='color:#94a3b8;font-size:10px;white-space:nowrap;"
                 f"font-family:JetBrains Mono,monospace'>{ts_str}</code>"
                 f"<span style='background:{color}22;color:{color};font-size:9px;"
                 f"font-weight:700;letter-spacing:0.5px;padding:2px 6px;"

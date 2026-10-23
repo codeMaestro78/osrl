@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from pathlib import Path
 
 import plotly.graph_objects as go
 import streamlit as st
 
 from osrl.dashboard.shared import (
     agent_mode, best_checkpoint, find_checkpoints, get_conn,
-    recent_events, safe_float, set_agent_mode,
+    set_agent_mode,
 )
 
 _BG, _PLOT = "rgba(0,0,0,0)", "rgba(6,13,26,0.95)"
-_FONT = dict(color="#64748b", size=11, family="Inter")
+_FONT = dict(color="#94a3b8", size=11, family="Inter")
 _GRID = "rgba(56,189,248,0.05)"
 _CHART = dict(
     paper_bgcolor=_BG, plot_bgcolor=_PLOT, font=_FONT,
@@ -30,7 +29,7 @@ _CHART = dict(
 _MODE_META = {
     "observe":   ("#38bdf8", "👁️",  "Watches silently. No actions taken."),
     "advise":    ("#f59e0b", "💡",  "Generates recommendations for human review."),
-    "autopilot": ("#818cf8", "🤖", "Acts autonomously within guard constraints."),
+    "autopilot": ("#818cf8", "🤖", "Queues eligible intents; a separate worker needs explicit --execute approval."),
 }
 
 
@@ -50,13 +49,14 @@ def _mode_card(mode: str, current: str) -> str:
     <div style='font-size:2rem;margin-bottom:6px'>{icon}</div>
     <div style='color:#f1f5f9;font-weight:700;font-size:15px;
                 text-transform:capitalize;margin-bottom:4px'>{mode}</div>
-    <div style='color:#475569;font-size:11px;margin-bottom:10px'>{desc}</div>
+    <div style='color:#94a3b8;font-size:11px;margin-bottom:10px'>{desc}</div>
     {badge}
 </div>"""
 
 
 def render() -> None:
     st.title("🤖 RL Agent")
+    st.caption("Mode is a stored preference. This dashboard does not start inference or an execution worker.")
     conn    = get_conn()
     refresh = st.session_state.get("refresh_s", 10)
 
@@ -74,7 +74,7 @@ def render() -> None:
                     box-shadow:0 0 30px {color}15;animation:slide-in-down 0.5s ease-out'>
             <div style='font-size:2.5rem;filter:drop-shadow(0 0 10px {color}80)'>{icon}</div>
             <div>
-                <div style='color:#334155;font-size:9px;text-transform:uppercase;
+                <div style='color:#94a3b8;font-size:9px;text-transform:uppercase;
                             letter-spacing:2px;font-weight:700'>Current Mode</div>
                 <div style='color:{color};font-size:26px;font-weight:800;
                             letter-spacing:-0.5px;font-family:Inter,sans-serif'>{current.upper()}</div>
@@ -127,7 +127,7 @@ def render() -> None:
             <div style='background:rgba(8,15,31,0.7);border:1px dashed rgba(56,189,248,0.2);
                         border-radius:12px;padding:24px;text-align:center'>
                 <div style='font-size:2.5rem;margin-bottom:8px'>🎯</div>
-                <div style='color:#475569'>No checkpoint yet — run training first.</div>
+                <div style='color:#94a3b8'>No checkpoint yet — run training first.</div>
             </div>""", unsafe_allow_html=True)
             return
 
@@ -216,45 +216,9 @@ def render() -> None:
     # ── Action ledger ─────────────────────────────────────────────────────────
     @st.fragment(run_every=refresh)
     def _ledger() -> None:
-        st.subheader("📋 Action Ledger")
-        st.caption("Recent actions taken by the RL agent")
-        try:
-            rows = [dict(r) for r in conn.execute(
-                "SELECT ts, pid, name, action, reason FROM actions_ledger "
-                "ORDER BY id DESC LIMIT 30"
-            ).fetchall()]
-        except Exception:  # noqa: BLE001
-            rows = []
-
-        if not rows:
-            st.markdown("""
-            <div style='background:rgba(8,15,31,0.6);border:1px dashed rgba(56,189,248,0.15);
-                        border-radius:10px;padding:20px;text-align:center;color:#334155'>
-                No agent actions yet. Switch to Autopilot mode to enable autonomous actions.
-            </div>""", unsafe_allow_html=True)
-            return
-
-        _ACTION_COLOR = {
-            "noop": "#334155", "alert": "#f59e0b",
-            "renice_back": "#22c55e", "request_approval": "#818cf8",
-            "tune_threshold": "#38bdf8",
-        }
-        for r in rows:
-            ts_s   = dt.datetime.fromtimestamp(float(r["ts"])).strftime("%H:%M:%S")
-            action = r.get("action", "noop")
-            color  = _ACTION_COLOR.get(action, "#64748b")
-            st.markdown(
-                f"<div style='display:flex;gap:10px;align-items:center;padding:7px 12px;"
-                f"margin:2px 0;border-radius:8px;background:rgba(8,15,31,0.8);"
-                f"border-left:3px solid {color};animation:slide-in-up 0.3s ease-out'>"
-                f"<code style='color:#334155;font-size:10px;font-family:JetBrains Mono,monospace'>{ts_s}</code>"
-                f"<span style='background:{color}22;color:{color};font-size:10px;"
-                f"font-weight:700;letter-spacing:0.5px;padding:2px 8px;border-radius:4px'>{action.upper()}</span>"
-                f"<span style='color:#64748b;font-size:12px'>PID {r.get('pid','?')} — {r.get('name','?')}</span>"
-                f"<span style='color:#334155;font-size:11px;margin-left:auto'>{r.get('reason','')}</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
+        from osrl.dashboard.shared import render_action_ledger
+        st.subheader("Action Ledger")
+        render_action_ledger(conn)
 
     _ledger()
     st.divider()
@@ -283,10 +247,10 @@ def render() -> None:
                 st.markdown(
                     f"<div style='display:flex;gap:8px;padding:5px 10px;margin:2px 0;"
                     f"border-radius:6px;background:rgba(8,15,31,0.7);border-left:2px solid {_C.get(k,'#475569')}'>"
-                    f"<code style='color:#334155;font-size:10px;font-family:JetBrains Mono,monospace'>{ts_s}</code>"
+                    f"<code style='color:#94a3b8;font-size:10px;font-family:JetBrains Mono,monospace'>{ts_s}</code>"
                     f"<span>{_I.get(k,'•')}</span>"
                     f"<span style='color:{_C.get(k,'#64748b')};font-size:11px;font-weight:600'>{k}</span>"
-                    f"<span style='color:#475569;font-size:11px'>{detail}</span>"
+                    f"<span style='color:#94a3b8;font-size:11px'>{detail}</span>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )

@@ -7,13 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libffi-dev curl procps && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[rl]" || \
-    pip install --no-cache-dir streamlit plotly pandas torch --extra-index-url https://download.pytorch.org/whl/cpu
-
-# Copy source
+# Install the package only after its declared source packages exist.
+# A failed build must fail visibly, rather than ship a partial RL stack.
 COPY . .
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir ".[rl,dashboard]" supervisor
 
 # Data directory
 RUN mkdir -p /data && chmod 777 /data
@@ -24,7 +22,6 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8501
 
 # Startup: run both collector + dashboard via supervisord
-RUN pip install --no-cache-dir supervisor
 
 COPY deploy/supervisord.conf /etc/supervisord.conf
 

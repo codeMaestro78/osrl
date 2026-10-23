@@ -37,6 +37,7 @@ osrl.worker with the intent lease in hand.
 from __future__ import annotations
 
 import os
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -160,7 +161,7 @@ class Guard:
 
         # 3 identity ---------------------------------------------------------
         st = self.d.start_time_of(req.pid)
-        if st is None:
+        if st is None or not math.isfinite(st) or not math.isfinite(req.start_time):
             return fail("identity", f"pid {req.pid} not found")
         if abs(st - req.start_time) > 1e-3:
             return fail(
@@ -181,7 +182,7 @@ class Guard:
         staleness = self._staleness(now)
         if staleness is None:
             return fail("telemetry_fresh", "no samples in store")
-        if staleness > self.cfg.staleness_max_s:
+        if not math.isfinite(staleness) or staleness < 0 or staleness > self.cfg.staleness_max_s:
             return fail(
                 "telemetry_fresh",
                 f"stale telemetry: {staleness:.1f}s > "

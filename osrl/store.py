@@ -626,13 +626,13 @@ class Store:
         claim); past max_tries they expire so a poison message cannot loop
         forever. Run this periodically from the daemon.
         """
-        rows = self._conn.execute(
-            "SELECT id, tries, claimed_ts FROM intents"
-            " WHERE status='claimed' AND claimed_ts <= ?",
-            (now - lease_s,),
-        ).fetchall()
         actions: list[tuple[str, str]] = []
         with self._txn() as conn:
+            rows = conn.execute(
+                "SELECT id, tries, claimed_ts FROM intents"
+                " WHERE status='claimed' AND claimed_ts <= ?",
+                (now - lease_s,),
+            ).fetchall()
             for row in rows:
                 if row["tries"] >= max_tries:
                     conn.execute(

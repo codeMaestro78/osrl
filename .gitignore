@@ -21,3 +21,8 @@ data/*
 # Editors
 .idea/
 .vscode/
+
+# Local browser verification and process locks
+.playwright-cli/
+*.training.lock
+*.scheduler.lock

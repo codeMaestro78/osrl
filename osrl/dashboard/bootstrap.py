@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
+import uuid
 import tempfile
 from pathlib import Path
 
@@ -42,6 +44,15 @@ def bootstrap_database(root: Path | None = None) -> str:
         if not chosen.exists() or chosen.stat().st_size == 0:
             chosen.parent.mkdir(parents=True, exist_ok=True)
             ensure_schema(chosen)
+        try:
+            with sqlite3.connect(f"file:{chosen}?mode=ro", uri=True) as conn:
+                if conn.execute("SELECT 1 FROM meta WHERE key='demo_snapshot'").fetchone():
+                    os.environ["OSRL_DEMO"] = "1"
+        except sqlite3.Error:
+            pass
+        # Keep auto-selected demo mode stable over Streamlit reruns too.
+        if chosen.resolve() == (_work_dir() / "demo.db").resolve():
+            os.environ["OSRL_DEMO"] = "1"
         return str(chosen)
 
     local_live = root / "data" / "telemetry.db"
@@ -62,7 +73,7 @@ def bootstrap_database(root: Path | None = None) -> str:
         )
         if stale:
             # Atomic replace so concurrent first sessions never read a partial file.
-            tmp = work / f".demo.{os.getpid()}.tmp"
+            tmp = work / f".demo.{uuid.uuid4().hex}.tmp"
             shutil.copy2(demo_src, tmp)
             os.replace(tmp, demo_dst)
         os.environ["OSRL_DEMO"] = "1"

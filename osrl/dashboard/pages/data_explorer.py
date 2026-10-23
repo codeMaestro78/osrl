@@ -6,7 +6,6 @@ import datetime
 import json
 
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
 
 from osrl.dashboard.shared import checkpoint_dir, get_conn, training_available
@@ -62,9 +61,7 @@ def render() -> None:
             "SELECT ts, payload FROM events WHERE kind='auto_train_triggered' ORDER BY id DESC LIMIT 1"
         ).fetchone()
 
-        running_row = conn.execute(
-            "SELECT ts FROM events WHERE kind='auto_train_running' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+
 
         if row is None:
             st.warning(
@@ -96,13 +93,14 @@ def render() -> None:
             # Status indicator
             if staleness > 300:
                 st.warning("⚠️ Scheduler heartbeat stale >5 min — may have stopped")
+            elif not p.get("telemetry_fresh", True):
+                st.warning("Collector telemetry is stale. Automatic training waits for fresh data.")
             elif is_run:
                 st.success("🏋️ Training is **currently running**")
             elif trig and float(trig[0]) > float(row[0]) - 120:
                 st.info("🚀 Training was triggered recently — starting up…")
             else:
-                pct_done = min(100, int(new_samp / max(1, needed + new_samp) * 100)) if needed > 0 else 100
-                st.info(f"✅ Scheduler running — waiting for conditions")
+                st.info("✅ Scheduler running — waiting for conditions")
 
             # Metrics
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -119,7 +117,7 @@ def render() -> None:
                 st.progress(sample_pct, text=f"{new_samp:,} / {needed + new_samp:,} samples")
 
             if wait_s > 0:
-                time_pct = 1.0 - min(1.0, wait_s / 3600.0)
+                time_pct = 1.0 - min(1.0, wait_s / max(1.0, p.get("min_interval_s", 3600.0)))
                 st.markdown("**Time interval progress:**")
                 st.progress(time_pct, text=f"Waiting {wait_s // 60} more minutes")
 
@@ -164,7 +162,7 @@ def render() -> None:
                         f"<div style='display:flex;gap:8px;align-items:flex-start;"
                         f"padding:6px 10px;margin:2px 0;border-radius:6px;"
                         f"background:rgba(15,30,60,0.5);border-left:3px solid {color}'>"
-                        f"<code style='color:#475569;font-size:11px;white-space:nowrap'>{ts_str}</code>"
+                        f"<code style='color:#94a3b8;font-size:11px;white-space:nowrap'>{ts_str}</code>"
                         f"<span>{icon}</span>"
                         f"<span style='color:{color};font-weight:600;font-size:12px;white-space:nowrap'>{kind}</span>"
                         f"<span style='color:#94a3b8;font-size:11px'>{detail}</span>"
@@ -177,7 +175,7 @@ def render() -> None:
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("🚀 Trigger Training NOW", type="primary",
-                         help="Bypass scheduler — launch training immediately"):
+                         help="Launch a candidate training run", disabled=not training_available()):
                 _trigger_now(conn)
         with col2:
             st.caption(f"Min samples: {MIN_SAMPLES} | Min interval: 1h")
@@ -271,7 +269,6 @@ def render() -> None:
         if not rows:
             return
 
-        ts_vals = [datetime.datetime.fromtimestamp(float(r[0])) for r in rows]
         data = {col: [r[i+1] for r in rows] for i, col in enumerate(selected_cols)}
 
         # Draw charts in 2-column grid
@@ -335,12 +332,9 @@ def render() -> None:
             st.info("Need at least 10 samples to compute correlations.")
             return
 
-        import numpy as np
-        mat = np.array([[r[i] if r[i] is not None else 0.0 for i in range(len(cols))] for r in rows], dtype=float)
-        # Compute correlation matrix
-        with np.errstate(all="ignore"):
-            corr = np.corrcoef(mat.T)
-            corr = np.nan_to_num(corr, nan=0.0)
+        import pandas as pd
+        # Pairwise complete observations: missing GPU/PSI never becomes zero.
+        corr = pd.DataFrame([list(r) for r in rows], columns=cols).corr(min_periods=10).to_numpy()
 
         fig = go.Figure(go.Heatmap(
             z=corr, x=labels, y=labels,
@@ -409,7 +403,6 @@ def render() -> None:
         # Missing value audit
         st.divider()
         st.markdown("**Feature completeness (% non-null)**")
-        all_cols = [f[0] for f in FEATURES]
         completeness = []
         for col, lbl in FEATURES:
             n = conn.execute(f"SELECT COUNT(*) FROM samples WHERE {col} IS NOT NULL").fetchone()[0]
@@ -442,7 +435,7 @@ MIN_SAMPLES = 500
 
 def _trigger_now(conn) -> None:
     """Force-write an event to trigger training on next scheduler poll."""
-    import subprocess, sys, time
+    import time
 
     if not training_available():
         st.info(
@@ -465,14 +458,8 @@ def _trigger_now(conn) -> None:
         pass
 
     try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "osrl.rl.train",
-             "--db", db_path, "--steps", "50000", "--synthetic",
-             "--checkpoint-dir",
-             str(checkpoint_dir())],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        from osrl.rl.auto_train import _launch_training
+        proc = _launch_training(db_path, 50_000, True, checkpoint_dir(), True)
         st.success(f"✅ Training launched (PID {proc.pid}) — check Training page for progress.")
     except Exception as e:  # noqa: BLE001
         st.error(f"❌ Failed: {e}")

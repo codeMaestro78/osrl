@@ -77,11 +77,14 @@ class PsiTrigger:
     def __init__(self, spec: TriggerSpec, path: str | Path) -> None:
         self.spec = spec
         self.path = Path(path)
-        self.fd = os.open(str(self.path), os.O_RDWR | os.O_NONBLOCK)
+        self.fd = -1
         try:
+            self.fd = os.open(str(self.path), os.O_RDWR | os.O_NONBLOCK)
             os.write(self.fd, (spec.text + "\x00").encode())
         except OSError as err:
-            os.close(self.fd)
+            if self.fd >= 0:
+                os.close(self.fd)
+                self.fd = -1
             raise PsiRegistrationError(spec, self.path, err.errno) from err
 
     def fileno(self) -> int:

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 import uuid
@@ -47,16 +48,24 @@ def build_request_from_intent(intent_row) -> ActionRequest | None:
     payload = it.get("payload")
     try:
         data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        if not isinstance(data, dict):
+            return None
     except (TypeError, ValueError):
         return None
     try:
         pid = int(data["pid"])
         start_time = float(data["start_time"])
         kind = str(it["kind"])
-    except (KeyError, TypeError, ValueError):
+        if isinstance(data["pid"], bool) or float(data["pid"]) != pid:
+            return None
+        if not math.isfinite(start_time) or start_time <= 0:
+            return None
+        target_nice = data.get("target_nice")
+        if target_nice is not None:
+            target_nice = int(target_nice)
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
     parent = data.get("parent_action_id")
-    target_nice = data.get("target_nice")
     return ActionRequest(
         kind=kind,
         pid=pid,
