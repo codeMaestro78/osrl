@@ -9,7 +9,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from osrl.dashboard.shared import (
-    agent_mode, best_checkpoint, find_checkpoints, get_conn,
+    agent_mode,
+    best_checkpoint,
+    find_checkpoints,
+    get_conn,
     set_agent_mode,
 )
 
@@ -151,6 +154,127 @@ def render() -> None:
             </div>""", unsafe_allow_html=True)
 
     _policy_status()
+    st.divider()
+
+    # ── Recommendation uncertainty ───────────────────────────────────────────
+    @st.fragment(run_every=refresh)
+    def _recommendation_assessment() -> None:
+        st.subheader("Recommendation Evidence")
+        row = conn.execute(
+            "SELECT ts, payload FROM events WHERE kind='policy_suggestion'"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            st.caption("No inference recommendation has been recorded yet.")
+            return
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            st.warning("The latest recommendation record could not be parsed.")
+            return
+        uncertainty = payload.get("uncertainty") or {}
+        c1, c2, c3 = st.columns(3)
+        probability = payload.get("probability")
+        c1.metric("Policy probability", "—" if probability is None else f"{probability:.1%}")
+        age = uncertainty.get("telemetry_age_s")
+        c2.metric("Telemetry age", "—" if age is None else f"{age:.1f} s")
+        count = uncertainty.get("relevant_outcomes")
+        c3.metric("Relevant measured outcomes", "—" if count is None else str(count))
+        st.caption(
+            f"Latest action: {payload.get('action', 'unknown')} · "
+            f"mode: {payload.get('mode', 'unknown')} · "
+            f"risk state: {uncertainty.get('risk_level', 'unknown')} · "
+            "policy probability is not calibrated confidence."
+        )
+        reasons = uncertainty.get("reasons") or []
+        if reasons:
+            st.warning("Recommendation abstained: " + ", ".join(map(str, reasons)))
+        elif payload.get("intent_gate_reason"):
+            st.info("No intent queued: " + str(payload["intent_gate_reason"]))
+        else:
+            st.success("The recommendation passed the recorded uncertainty checks.")
+        if uncertainty.get("signal_disagreement") is True:
+            st.caption("The current risk state conflicts with the latest pressure signals.")
+
+    _recommendation_assessment()
+    st.divider()
+
+    # ── Measured action outcomes ──────────────────────────────────────────────
+    @st.fragment(run_every=refresh)
+    def _action_outcomes() -> None:
+        st.subheader("Intervention Outcomes")
+        rows = conn.execute(
+            "SELECT intent_id, action_id, created_ts, status, details"
+            " FROM action_outcomes ORDER BY created_ts DESC LIMIT 30"
+        ).fetchall()
+        if not rows:
+            st.caption("No guarded intervention attempts have been recorded.")
+            return
+        table = []
+        for row in rows:
+            try:
+                details = json.loads(row["details"] or "{}")
+            except (TypeError, ValueError):
+                details = {}
+            measurement = details.get("measurement") or {}
+            status = row["status"]
+            result = {
+                "pending": "Waiting for post-action window",
+                "measured": "Measured before/after",
+                "insufficient_telemetry": "Insufficient telemetry",
+                "not_applied": details.get("attempt_status", "Not applied"),
+            }.get(status, status)
+            recovered = measurement.get("recovered_seconds")
+            psi_change = measurement.get("psi_mem_change")
+            cpu_change = measurement.get("target_cpu_pct_delta")
+            system_cpu_before = measurement.get("cpu_before_avg_pct")
+            system_cpu_after = measurement.get("cpu_after_avg_pct")
+            mem_before = measurement.get("mem_available_before_avg_bytes")
+            mem_after = measurement.get("mem_available_after_avg_bytes")
+            system_cpu_change = (
+                system_cpu_after - system_cpu_before
+                if system_cpu_before is not None and system_cpu_after is not None
+                else None
+            )
+            mem_change_mib = (
+                (mem_after - mem_before) / (1024**2)
+                if mem_before is not None and mem_after is not None
+                else None
+            )
+            table.append({
+                "Intent": str(row["intent_id"])[:8],
+                "Action": str(row["action_id"] or "—")[:8],
+                "Attempt": dt.datetime.fromtimestamp(float(row["created_ts"])).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "Result": result,
+                "Reason": details.get("reason", measurement.get("reason", "")),
+                "Pressure before": measurement.get("pressure_before", "—"),
+                "Pressure after": measurement.get("pressure_after", "—"),
+                "Recovery s": "—" if recovered is None else round(float(recovered), 1),
+                "Pressure returned": (
+                    "—" if measurement.get("pressure_returned") is None
+                    else str(bool(measurement["pressure_returned"]))
+                ),
+                "Memory PSI Δ": "—" if psi_change is None else f"{float(psi_change):+.1%}",
+                "System CPU Δ": (
+                    "—" if system_cpu_change is None else f"{float(system_cpu_change):+.1f} pp"
+                ),
+                "Available Memory Δ": (
+                    "—" if mem_change_mib is None else f"{float(mem_change_mib):+.0f} MiB"
+                ),
+                "Target CPU Δ": "—" if cpu_change is None else f"{float(cpu_change):+.1f} pp",
+                "Foreground impact": "Not collected",
+            })
+        st.dataframe(table, hide_index=True, width="stretch")
+        st.caption(
+            "Applied actions are measured over a 30 s pre-window and 120 s post-window. "
+            "Results are observational, not causal; active foreground-app identity "
+            "is not collected. Rejected and failed attempts remain visible without "
+            "attributing telemetry changes to them."
+        )
+
+    _action_outcomes()
     st.divider()
 
     # ── Reward trend chart ────────────────────────────────────────────────────

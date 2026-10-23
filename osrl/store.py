@@ -11,7 +11,8 @@ Operation rules implemented here (brief G):
   retries and competing workers are safe (no lost/double intents).
 - `sample_staleness` is the primitive later risk gates will use: stale or
   missing telemetry may NOT enable intervention behavior downstream.
-- Indexes on ts; retention deletes old raw samples/events. user_version=1.
+- Indexes on timestamps; retention prunes raw telemetry and transient events.
+  Schema changes are tracked with PRAGMA user_version.
 """
 
 from __future__ import annotations
@@ -121,6 +122,16 @@ CREATE TABLE IF NOT EXISTS actions_ledger (
 );
 CREATE INDEX IF NOT EXISTS idx_actions_pid_ts
     ON actions_ledger(target_pid, created_ts);
+
+CREATE TABLE IF NOT EXISTS action_outcomes (
+    intent_id TEXT PRIMARY KEY,
+    action_id TEXT UNIQUE,
+    created_ts REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN
+        ('pending','measured','insufficient_telemetry','not_applied')),
+    details TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_action_outcomes_ts ON action_outcomes(created_ts);
 """
 
 # Columns added in schema v2 (idempotent ALTER list for existing v1 dbs).
@@ -146,7 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_rl_metrics_ts ON rl_metrics(ts);
 
 
 class Store:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -172,6 +183,7 @@ class Store:
         and samples.gpu_top_procs_json; existing dbs are ALTERed in place,
         fresh dbs already carry the v2 layout and need only the marker.
         v2 -> v3: adds rl_metrics table + agent_mode default meta row.
+        v3 -> v4: adds durable intervention outcome records.
         An unknown FUTURE db version is a hard error (defensive).
         The intent-column index lives here (not in _SCHEMA) because legacy
         tables cannot take an index on a column they don't have yet.
@@ -306,6 +318,15 @@ class Store:
     def count_samples(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()
         return int(row["n"])
+
+    def recent_samples(self, limit: int = 300) -> list[sqlite3.Row]:
+        """Return the latest telemetry rows in chronological order."""
+        if limit < 1 or limit > 5000:
+            raise ValueError("sample limit must be between 1 and 5000")
+        rows = self._conn.execute(
+            "SELECT * FROM samples ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return list(reversed(rows))
 
     def latest_sample_ts(self) -> float | None:
         row = self._conn.execute("SELECT MAX(ts) AS m FROM samples").fetchone()
@@ -521,6 +542,125 @@ class Store:
             (intent_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_action_outcome(
+        self,
+        intent_id: str,
+        action_id: str | None,
+        status: str,
+        ts: float,
+        details: dict[str, Any],
+    ) -> bool:
+        """Persist one attempt; applied actions wait for their post-window."""
+        if status not in {"applied", "rejected", "failed"}:
+            raise ValueError(f"invalid action outcome status: {status!r}")
+        stored_status = "pending" if status == "applied" else "not_applied"
+        payload = {**details, "attempt_status": status}
+        try:
+            with self._txn() as conn:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO action_outcomes"
+                    " (intent_id, action_id, created_ts, status, details)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (intent_id, action_id, ts, stored_status,
+                     json.dumps(payload, sort_keys=True)),
+                )
+            return cur.rowcount == 1
+        except sqlite3.IntegrityError:
+            return False
+
+    def finalize_action_outcomes(
+        self, now: float, limit: int = 50, risk_config=None,
+        flush_grace_s: float = 15.0,
+    ) -> list[dict]:
+        """Measure matured applied attempts against their fixed telemetry window."""
+        from osrl.outcomes import (
+            DEFAULT_POST_WINDOW_S,
+            DEFAULT_PRE_WINDOW_S,
+            DEFAULT_WARMUP_S,
+            measure_action_outcome,
+        )
+        if not math.isfinite(flush_grace_s) or flush_grace_s < 0:
+            raise ValueError("flush_grace_s must be a finite non-negative number")
+
+        rows = self._conn.execute(
+            "SELECT o.intent_id, o.action_id, o.created_ts, o.details,"
+            " a.target_pid, a.ts_applied, a.kind"
+            " FROM action_outcomes o LEFT JOIN actions_ledger a ON a.id=o.action_id"
+            " WHERE o.status='pending' AND o.created_ts + ? + ? <= ?"
+            " ORDER BY o.created_ts, o.intent_id LIMIT ?",
+            (DEFAULT_POST_WINDOW_S, flush_grace_s, now, limit),
+        ).fetchall()
+        finalized = []
+        for row in rows:
+            action = dict(row)
+            applied_ts = action.get("ts_applied")
+            if applied_ts is None:
+                measurement = {
+                    "status": "insufficient_telemetry",
+                    "reason": "missing_action_ledger_or_apply_timestamp",
+                    "foreground_impact": None,
+                    "foreground_impact_note": (
+                        "Active foreground application identity is not collected."
+                    ),
+                }
+            else:
+                sample_rows = self._conn.execute(
+                    "SELECT * FROM samples WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                    (applied_ts - DEFAULT_PRE_WINDOW_S - DEFAULT_WARMUP_S,
+                     applied_ts + DEFAULT_POST_WINDOW_S),
+                ).fetchall()
+                measurement = measure_action_outcome(
+                    action,
+                    [dict(sample) for sample in sample_rows],
+                    risk_config=risk_config,
+                )
+            status = measurement.pop("status")
+            details = json.loads(row["details"] or "{}")
+            details["measurement"] = measurement
+            with self._txn() as conn:
+                changed = conn.execute(
+                    "UPDATE action_outcomes SET status=?, details=?"
+                    " WHERE intent_id=? AND status='pending'",
+                    (status, json.dumps(details, sort_keys=True), row["intent_id"]),
+                ).rowcount
+            if changed:
+                finalized.append({"intent_id": row["intent_id"], "status": status})
+        return finalized
+
+    def recent_action_outcomes(self, limit: int = 50) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT intent_id, action_id, created_ts, status, details"
+            " FROM action_outcomes ORDER BY created_ts DESC, intent_id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            details = json.loads(row["details"] or "{}")
+            measurement = details.get("measurement", {})
+            out.append({
+                **dict(row),
+                "details_json": row["details"],
+                "details": details,
+                "measured": row["status"] == "measured",
+                **measurement,
+            })
+        return out
+
+    def relevant_outcome_count(self, action: str, risk_level: str) -> int:
+        """Count measured outcomes for the same policy action and risk band."""
+        rows = self._conn.execute(
+            "SELECT details FROM action_outcomes WHERE status='measured'"
+        ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                context = json.loads(row["details"]).get("recommendation_context", {})
+            except (TypeError, ValueError):
+                continue
+            if context.get("action") == action and context.get("risk_level") == risk_level:
+                count += 1
+        return count
 
     # --------------------------------------------------------------- intents
 

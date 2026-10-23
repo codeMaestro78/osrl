@@ -26,7 +26,7 @@ def test_explicit_osrl_db_wins_and_is_initialized(tmp_path, monkeypatch):
     assert target.exists()
     assert os.environ.get("OSRL_DEMO") is None
     conn = sqlite3.connect(target)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 0
 
 
@@ -79,7 +79,7 @@ def test_missing_data_bootstraps_empty_schema(tmp_path, monkeypatch):
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert {"samples", "events", "rollups", "actions_ledger", "intents"} <= tables
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_auto_selected_demo_stays_demo_after_entrypoint_sets_osrl_db(tmp_path, monkeypatch):

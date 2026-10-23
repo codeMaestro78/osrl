@@ -10,7 +10,9 @@ import uuid
 import psutil
 import pytest
 
+import osrl.worker as worker
 from osrl.config import GuardConfig
+from osrl.executor import ExecutorError
 from osrl.guard import Guard, GuardDeps
 from osrl.store import Store
 from osrl.worker import process_pending
@@ -89,10 +91,36 @@ def test_execute_applies_renice_back_and_records_everything(env):
     assert result["action_id"] == row["id"]
     guard_checks = json.loads(row["guard_checks"])
     assert all(entry["passed"] for entry in guard_checks)
+    [outcome] = store.recent_action_outcomes()
+    assert outcome["action_id"] == row["id"]
+    assert outcome["status"] == "pending"
 
     kinds = [r["kind"] for r in store._conn.execute(
         "SELECT kind FROM events").fetchall()]
     assert "action_applied" in kinds
+
+
+def test_executor_failure_is_recorded_as_not_applied(env, monkeypatch):
+    store, child, _now, st = env
+    before = psutil.Process(child.pid).nice()
+    iid = put_intent(store, "renice_back", {"pid": child.pid, "start_time": st})
+
+    def fail_before_mutation(*args, **kwargs):
+        raise ExecutorError("simulated permission denial")
+
+    monkeypatch.setattr(worker, "apply_renice_back", fail_before_mutation)
+    result = worker.process_pending(
+        store, make_guard(store), GuardConfig(), now=time.time(),
+        worker_id="w-test", execute=True,
+    )
+
+    assert result[0]["outcome"] == "failed"
+    assert psutil.Process(child.pid).nice() == before
+    [outcome] = store.recent_action_outcomes()
+    assert outcome["intent_id"] == iid
+    assert outcome["status"] == "not_applied"
+    assert outcome["details"]["attempt_status"] == "failed"
+    assert "permission denial" in outcome["details"]["reason"]
 
 
 def test_rerate_within_spacing_is_rejected_not_applied(env):
@@ -153,6 +181,10 @@ def test_malformed_payload_rejected_with_reason(env):
     assert store._conn.execute(
         "SELECT status FROM intents WHERE id=?", (iid,)
     ).fetchone()["status"] == "rejected"
+    [outcome] = store.recent_action_outcomes()
+    assert outcome["intent_id"] == iid
+    assert outcome["status"] == "not_applied"
+    assert outcome["details"]["attempt_status"] == "rejected"
 
 
 def test_limit_releases_instead_of_consuming(env):

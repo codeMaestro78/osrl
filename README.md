@@ -6,7 +6,7 @@ classifies freeze risk, and permits only guarded, reversible interventions.
 Reinforcement learning is a candidate policy that must beat a measured
 baseline and pass an evaluation gate — it is never on the safety path.
 
-`Python 3.10+` · `Linux with PSI` · `253 tests` · `unprivileged by default`
+`Python 3.10+` · `Linux with PSI` · `263 tests` · `unprivileged by default`
 
 [Architecture](DESIGN.md) · [Quickstart](#quickstart) · [Dashboard](#dashboard) ·
 [Deployment](#deployment) · [Safety model](#safety-model)
@@ -30,7 +30,7 @@ kernel cannot provide them; nothing is fabricated as zero.
 | Layer | What ships | State |
 | --- | --- | --- |
 | **Telemetry** | 2 s collector: CPU total/per-core, RAM, swap, PSI `some`/`full`, `/proc/vmstat` deltas, GPU via NVML, top-15 processes, birth/death events | ✅ |
-| **Storage** | SQLite WAL, schema v3: `samples`, `rollups`, `events`, `meta`, `heartbeat`, `intents`, `actions_ledger`, `rl_metrics` | ✅ |
+| **Storage** | SQLite WAL, schema v4: telemetry, intents, action ledger, durable intervention outcomes, and RL metrics | ✅ |
 | **Risk** | `none` / `elevated` / `critical` / `unknown`, multi-signal escalation, hysteresis, staleness gate, PSI evidence requirement | ✅ |
 | **Actions** | `renice_back` only, behind `worker → guard → pidfd → executor → ledger` | ✅ gated; `--execute` required |
 | **Twin** | Session slicing, `noop`/`hold`/`linear`/`ewma`/`rolling-median` baselines, 30/60/120 s evaluation, renice forward model | ✅ abstains below 8 real pairs |
@@ -59,7 +59,7 @@ kernel cannot provide them; nothing is fabricated as zero.
             +------ osrl-collector (2 s) ---+
                             |
                             v
-                 SQLite WAL store (schema v3)
+                 SQLite WAL store (schema v4)
                  ├── samples / rollups / events / heartbeat
                  ├── intents ──► osrl.worker ──► guard ──► pidfd
                  │                                        │
@@ -125,7 +125,7 @@ For development and tests:
 
 ```bash
 ./.venv/bin/pip install -e ".[dev,dashboard]"
-./.venv/bin/python -m pytest -q        # 252 passed, 1 optional fixture skipped
+./.venv/bin/python -m pytest -q        # 262 passed, 1 optional fixture skipped
 ```
 
 For RL training (installs PyTorch, Gymnasium, SB3):
@@ -235,6 +235,29 @@ repository. Inference supports `observe`, `advise`, and `autopilot` gates, but
 it is not started by the daemon; even `autopilot` intents still require the
 worker, guard, and executor.
 
+Run one explicit recommendation pass:
+
+```bash
+./.venv/bin/osrl-infer --db data/telemetry.db
+```
+
+It records the recommendation and its uncertainty reasons for the Agent page;
+it never executes an OS action. Intent admission requires ten contiguous
+observations and abstains on stale telemetry, disagreement between current
+risk and pressure signals,
+fewer than five measured outcomes for that action/risk band, weak policy
+probability, or an ambiguous action distribution. Policy probabilities are
+not calibrated confidence. Rejected and failed attempts stay visible but do
+not count as outcome evidence.
+
+Applied actions receive a 30-second pre-window and a 120-second post-window.
+The daemon finalizes the record only with adequate sample coverage, using the
+same risk tracker to report pressure, recovery time, and pressure return. The
+report also includes PSI/memory/system CPU and target-process CPU changes when
+available. Foreground-app impact remains unavailable because the collector
+does not identify the active application. These are before/after observations,
+not evidence that an action caused the change.
+
 ### Auto-training scheduler
 
 ```bash
@@ -327,7 +350,7 @@ itself as a snapshot in the UI.
 | --- | --- |
 | `streamlit_app.py` | Cloud entrypoint; resolves the DB before the dashboard imports its cached connection |
 | `requirements.txt` | Dashboard-only dependencies (no torch / SB3, keeping the Cloud build small) |
-| `osrl/dashboard/bootstrap.py` | DB resolution: `OSRL_DB` → local live DB → bundled snapshot → empty v3 store |
+| `osrl/dashboard/bootstrap.py` | DB resolution: `OSRL_DB` → local live DB → bundled snapshot → empty v4 store |
 | `data/demo_telemetry.db` | ≈7 h / 12k-sample recording, copied to `/tmp` at startup |
 | `.streamlit/config.toml` | Dark theme and headless defaults |
 
@@ -439,7 +462,7 @@ relevant counter history, so diffs never span outages.
 ```text
 osrl/
   collector.py      # 2 s sampler and process events
-  store.py          # SQLite schema v3, intents, ledger, rollups
+  store.py          # SQLite schema v4, intents, ledger, outcomes, rollups
   daemon.py         # single-instance collector service
   risk.py           # deterministic risk classifier + hysteresis
   psi_trigger.py    # kernel PSI monitors (poll/POLLPRI)
@@ -452,7 +475,7 @@ osrl/
   rl/               # env, obs, mask, reward, train, inference, auto_train
   dashboard/        # Streamlit app, pages, shared helpers, bootstrap
 deploy/             # systemd units, Docker/supervisord, tunnel, demo builder
-tests/              # 252 passed, 1 optional fixture skipped: collector, store, guard, twin, RL, safety
+tests/              # 262 passed, 1 optional fixture skipped: collector, store, guard, twin, RL, safety
 ```
 
 ## Known limitations

@@ -105,6 +105,7 @@ def test_training_save_resume_and_eval(replay_db, tmp_path, monkeypatch):
         [Sample(ts=1, interval_s=2, cpu_total_pct=20)], AgentState(), "advise"
     )
     assert not suggestion.validated
+    assert suggestion.uncertainty.policy_entropy is not None
     assert policy.write_intent_if_advised(suggestion, None, []) is None
 
 

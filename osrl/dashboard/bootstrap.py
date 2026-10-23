@@ -9,7 +9,7 @@ Resolution order:
 2. ``<root>/data/telemetry.db`` when present (local runs with a collector),
 3. bundled ``<root>/data/demo_telemetry.db`` copied to a writable temp dir
    (Streamlit Community Cloud, ephemeral filesystem),
-4. an empty v3 store in the temp dir (first-run placeholder).
+4. an empty v4 store in the temp dir (first-run placeholder).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 def ensure_schema(path: Path) -> None:
-    """Create an empty v3 store so every page can query instead of crashing."""
+    """Create an empty v4 store so every page can query instead of crashing."""
     from osrl.store import Store
 
     store = Store(path)

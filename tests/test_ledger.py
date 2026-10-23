@@ -162,7 +162,7 @@ def test_v1_to_v2_migration_preserves_ledger_rows(tmp_path):
     store = Store(db)
     try:
         ver = store._conn.execute("PRAGMA user_version").fetchone()[0]
-        assert ver == Store.SCHEMA_VERSION  # v3 after adding rl_metrics
+        assert ver == Store.SCHEMA_VERSION  # latest schema after migrations
         lead = store.action_row("legacy-1")
         assert lead["status"] == "applied"
         assert lead["target_pid"] == 7

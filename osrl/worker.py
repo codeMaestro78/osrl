@@ -76,6 +76,21 @@ def build_request_from_intent(intent_row) -> ActionRequest | None:
     )
 
 
+def _outcome_context(intent_row) -> dict:
+    """Keep policy context beside measured outcomes when it was supplied."""
+    try:
+        payload = (
+            intent_row.get("payload")
+            if isinstance(intent_row, dict)
+            else intent_row["payload"]
+        )
+        data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    except (KeyError, TypeError, ValueError):
+        return {}
+    context = data.get("recommendation_context")
+    return {"recommendation_context": context} if isinstance(context, dict) else {}
+
+
 def process_one_intent(
     store: Store,
     guard: Guard,
@@ -97,6 +112,10 @@ def process_one_intent(
         store.record_event(now, "action_rejected",
                            {"intent_id": intent_row["id"],
                             "reason": "malformed_payload"})
+        store.record_action_outcome(
+            intent_row["id"], None, "rejected", now,
+            {"reason": "malformed_payload", **_outcome_context(intent_row)},
+        )
         return {"intent_id": intent_row["id"], "outcome": "rejected",
                 "reason": "malformed_payload"}
 
@@ -134,6 +153,11 @@ def process_one_intent(
                             "action_id": row_id,
                             "kind": request.kind,
                             "reason": verdict.reason})
+        store.record_action_outcome(
+            intent_row["id"], row_id, "rejected", now,
+            {"kind": request.kind, "reason": verdict.reason,
+             **_outcome_context(intent_row)},
+        )
         return {"intent_id": intent_row["id"], "outcome": "rejected",
                 "reason": verdict.reason}
 
@@ -161,17 +185,24 @@ def process_one_intent(
                 capable=guard_cfg.restore_capable,
             )
     except (ExecutorError, TargetGone) as exc:
-        store.mark_action_failed(row_id, clock(), str(exc))
+        failed_ts = clock()
+        store.mark_action_failed(row_id, failed_ts, str(exc))
         store.finish_intent(intent_row["id"], "failed", str(exc), now)
         store.record_event(now, "action_failed",
                            {"intent_id": intent_row["id"],
                             "action_id": row_id,
                             "kind": request.kind,
                             "error": str(exc)})
+        store.record_action_outcome(
+            intent_row["id"], row_id, "failed", failed_ts,
+            {"kind": request.kind, "reason": str(exc),
+             **_outcome_context(intent_row)},
+        )
         return {"intent_id": intent_row["id"], "outcome": "failed",
                 "reason": str(exc)}
 
-    store.mark_action_applied(row_id, clock(), applied)
+    applied_ts = clock()
+    store.mark_action_applied(row_id, applied_ts, applied)
     store.finish_intent(
         intent_row["id"], "applied",
         {"action_id": row_id, "applied_nice": applied}, now,
@@ -182,6 +213,10 @@ def process_one_intent(
                         "kind": request.kind,
                         "pid": request.pid,
                         "applied_nice": applied})
+    store.record_action_outcome(
+        intent_row["id"], row_id, "applied", applied_ts,
+        {"kind": request.kind, **_outcome_context(intent_row)},
+    )
     return {"intent_id": intent_row["id"], "outcome": "applied",
             "applied_nice": applied}
 

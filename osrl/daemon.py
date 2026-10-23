@@ -205,6 +205,13 @@ def _run_locked(
                 store.insert_samples(batch)
                 batch.clear()
                 last_flush = ts
+            flush_grace = max(
+                15.0, ret.batch_interval_s + cfg.collector.interval_s
+            )
+            for outcome in store.finalize_action_outcomes(
+                ts, risk_config=cfg.risk, flush_grace_s=flush_grace
+            ):
+                store.record_event(ts, "action_outcome_ready", outcome)
             rollup_until = _rollup_complete_windows(store, ts, rollup_until,
                                                     ret.rollup_seconds)
 

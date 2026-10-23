@@ -31,6 +31,22 @@ def test_reopening_existing_db_works(tmp_path):
     st2.close()
 
 
+def test_v3_database_migrates_to_action_outcomes(tmp_path):
+    db = tmp_path / "v3.db"
+    old = Store(db)
+    old._conn.execute("PRAGMA user_version=3")
+    old.close()
+
+    migrated = Store(db)
+    try:
+        assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert migrated._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='action_outcomes'"
+        ).fetchone()[0] == "action_outcomes"
+    finally:
+        migrated.close()
+
+
 def test_newer_schema_is_rejected(tmp_path):
     db = tmp_path / "t.db"
     st = Store(db)

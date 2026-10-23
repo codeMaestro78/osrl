@@ -1,5 +1,27 @@
 # Correctness, training and dashboard improvements
 
+## Intervention outcome and uncertainty pass
+
+- Schema v4 stores every guarded applied, rejected, and failed intent attempt.
+  Applied actions wait through a 120-second post-window plus collector flush
+  grace, then compare a 30-second pre-window with the following telemetry.
+  Incomplete or gapped windows remain explicitly unmeasured.
+- Outcomes replay the existing `RiskTracker` across the window and report
+  pressure before/after, recovery time, pressure return, memory PSI and
+  availability, system CPU, and target-process CPU delta. Active foreground
+  app identity is not collected, so foreground impact stays unavailable.
+- The Agent page shows the latest recommendation evidence and attempt
+  outcomes. `osrl-infer` runs one explicit advisory pass and records an event;
+  it does not execute actions or start from the collector daemon.
+- A suggestion is ineligible for an intent when telemetry is stale or missing,
+  the current risk state conflicts with pressure signals, fewer than five
+  measured outcomes exist for the same action/risk band, policy probability is
+  below 0.70, or normalized action entropy is above 0.60. Probabilities remain
+  explicitly uncalibrated. Rejected/failed attempts are tracked but do not
+  count as measured action experience.
+- Before/after values are observations, not causal estimates. No counterfactual
+  matcher or live-action benefit claim was added.
+
 Reviewed the Python runtime, RL environment/inference/training/scheduler,
 forecast and alarm evaluation, SQLite flows, all dashboard pages, existing
 tests, architecture notes, and deployment configuration. Local changes only;
@@ -44,7 +66,7 @@ existing untracked checkpoints were preserved.
 
 ## Validation
 
-- `.venv/bin/python -m pytest -o addopts='' -q`: **252 passed, 1 skipped**.
+- `.venv/bin/python -m pytest -o addopts='' -q`: **262 passed, 1 skipped**.
   The skip requires an external historical hold-test database that is absent.
 - New regression tests were first run against the old implementation and
   reproduced eight failures before fixes.

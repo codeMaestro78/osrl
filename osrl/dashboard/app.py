@@ -88,6 +88,9 @@ section[data-testid="stSidebar"] {
     border-image: linear-gradient(180deg, rgba(56,189,248,0.4), rgba(129,140,248,0.2), rgba(56,189,248,0.4)) 1;
     animation: fade-in 0.6s ease-out;
 }
+section[data-testid="stSidebar"] div[data-testid="stSidebarNav"] {
+    display: none !important;
+}
 section[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
 
 /* ── Metric cards — glass + glow ── */

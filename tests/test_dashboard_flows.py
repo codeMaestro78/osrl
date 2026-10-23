@@ -49,6 +49,10 @@ def dashboard(tmp_path, monkeypatch):
         status="rejected",
         error="identity drift",
     )
+    store.record_action_outcome(
+        "dashboard-attempt", None, "rejected", now,
+        {"reason": "identity drift"},
+    )
     store.close()
     monkeypatch.setenv("OSRL_DB", str(db))
     monkeypatch.setenv("OSRL_DEMO", "1")
@@ -69,6 +73,8 @@ def test_all_dashboard_pages_render_partial_telemetry(dashboard):
     assert any("Reason" in frame.value.columns for frame in dashboard.dataframe)
     dashboard.radio[0].set_value("🤖 Agent").run(timeout=30)
     assert any("Reason" in frame.value.columns for frame in dashboard.dataframe)
+    assert "Recommendation Evidence" in [item.value for item in dashboard.subheader]
+    assert "Intervention Outcomes" in [item.value for item in dashboard.subheader]
 
 
 def test_evaluation_generates_report_and_is_clear_about_evidence(dashboard):
